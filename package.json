@@ -1,0 +1,100 @@
+{
+	"name": "shadow-accept",
+	"displayName": "Shadow Accept",
+	"description": "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. 100% free, no limits, open source by Nakedo Corp.",
+	"version": "1.0.0",
+	"publisher": "NakedoCorp",
+	"license": "MIT",
+	"icon": "media/icon.png",
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/NakedoCorp/shadow-accept.git"
+	},
+	"categories": [
+		"Machine Learning",
+		"Other"
+	],
+	"keywords": [
+		"antigravity",
+		"cursor",
+		"vscode",
+		"ai",
+		"auto-accept",
+		"agent",
+		"copilot",
+		"claude"
+	],
+	"engines": {
+		"vscode": "^1.75.0"
+	},
+	"activationEvents": [
+		"onStartupFinished"
+	],
+	"main": "dist/extension.js",
+	"scripts": {
+		"compile": "npx esbuild extension.js --bundle --outfile=dist/extension.js --external:vscode --platform=node --format=cjs",
+		"package": "npx vsce package",
+		"test": "node test/test.js"
+	},
+	"contributes": {
+		"commands": [
+			{
+				"command": "shadow-accept.toggle",
+				"title": "Shadow Accept: Toggle ON/OFF"
+			},
+			{
+				"command": "shadow-accept.openSettings",
+				"title": "Shadow Accept: Settings"
+			}
+		],
+		"configuration": {
+			"title": "Shadow Accept",
+			"properties": {
+				"shadowAccept.pollInterval": {
+					"type": "number",
+					"default": 800,
+					"minimum": 300,
+					"maximum": 5000,
+					"description": "Polling interval in milliseconds (how often to scan for accept buttons)"
+				},
+				"shadowAccept.bannedCommands": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [
+						"rm -rf /",
+						"rm -rf ~",
+						"rm -rf *",
+						"format c:",
+						"del /f /s /q",
+						"rmdir /s /q",
+						":(){:|:&};:",
+						"dd if=",
+						"mkfs.",
+						"> /dev/sda",
+						"chmod -R 777 /"
+					],
+					"description": "Command patterns that will never be auto-accepted. Supports plain substrings or /regex/flags."
+				},
+				"shadowAccept.enableOnStartup": {
+					"type": "boolean",
+					"default": false,
+					"description": "Automatically enable Shadow Accept when VS Code starts"
+				}
+			}
+		}
+	},
+	"devDependencies": {
+		"esbuild": "^0.27.3"
+	},
+	"dependencies": {
+		"ws": "^8.19.0"
+	},
+	"author": "",
+	"type": "commonjs",
+	"bugs": {
+		"url": "https://github.com/NakedoCorp/shadow-accept/issues"
+	},
+	"homepage": "https://github.com/NakedoCorp/shadow-accept#readme"
+}
