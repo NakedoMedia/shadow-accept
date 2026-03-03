@@ -1,14 +1,14 @@
 {
 	"name": "shadow-accept",
 	"displayName": "Shadow Accept",
-	"description": "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. 100% free, no limits, open source by Nakedo Corp.",
+	"description": "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. 100% free, no limits, open source by NakedoMedia.",
 	"version": "1.0.0",
-	"publisher": "NakedoCorp",
+	"publisher": "NakedoMedia",
 	"license": "MIT",
 	"icon": "media/icon.png",
 	"repository": {
 		"type": "git",
-		"url": "git+https://github.com/NakedoCorp/shadow-accept.git"
+		"url": "git+https://github.com/NakedoMedia/shadow-accept.git"
 	},
 	"categories": [
 		"Machine Learning",
@@ -94,7 +94,7 @@
 	"author": "",
 	"type": "commonjs",
 	"bugs": {
-		"url": "https://github.com/NakedoCorp/shadow-accept/issues"
+		"url": "https://github.com/NakedoMedia/shadow-accept/issues"
 	},
-	"homepage": "https://github.com/NakedoCorp/shadow-accept#readme"
+	"homepage": "https://github.com/NakedoMedia/shadow-accept#readme"
 }

@@ -3862,14 +3862,14 @@ var require_package = __commonJS({
     module2.exports = {
       name: "shadow-accept",
       displayName: "Shadow Accept",
-      description: "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. 100% free, no limits, open source by Nakedo Corp.",
+      description: "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. 100% free, no limits, open source by NakedoMedia.",
       version: "1.0.0",
-      publisher: "NakedoCorp",
+      publisher: "NakedoMedia",
       license: "MIT",
       icon: "media/icon.png",
       repository: {
         type: "git",
-        url: "git+https://github.com/NakedoCorp/shadow-accept.git"
+        url: "git+https://github.com/NakedoMedia/shadow-accept.git"
       },
       categories: [
         "Machine Learning",
@@ -3955,9 +3955,9 @@ var require_package = __commonJS({
       author: "",
       type: "commonjs",
       bugs: {
-        url: "https://github.com/NakedoCorp/shadow-accept/issues"
+        url: "https://github.com/NakedoMedia/shadow-accept/issues"
       },
-      homepage: "https://github.com/NakedoCorp/shadow-accept#readme"
+      homepage: "https://github.com/NakedoMedia/shadow-accept#readme"
     };
   }
 });
@@ -4264,7 +4264,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     <div class="header-logo">\u26A1</div>
     <div>
         <div class="header-title">Shadow Accept</div>
-        <div class="header-sub">by Nakedo Corp \u2014 MIT License \u2014 Free forever</div>
+        <div class="header-sub">by NakedoMedia \u2014 nakedo.ai \u2014 Free forever</div>
     </div>
 </div>
 
@@ -4322,6 +4322,7 @@ Supports /regex/flags syntax.">${bannedStr}</textarea>
 <div class="footer">
     <span class="footer-logo">NAKEDO CORP</span>
     <div class="footer-links">
+        <a onclick="openWebsite()">nakedo.ai</a>
         <a onclick="openGitHub()">GitHub</a>
         <a onclick="reportIssue()">Report issue</a>
     </div>
@@ -4385,8 +4386,9 @@ function resetDefaults() {
 }
 
 function showLog()       { vscode.postMessage({ type: 'openOutput' }); }
-function openGitHub()    { vscode.postMessage({ type: 'openLink', url: 'https://github.com/NakedoCorp/shadow-accept' }); }
-function reportIssue()   { vscode.postMessage({ type: 'openLink', url: 'https://github.com/NakedoCorp/shadow-accept/issues' }); }
+function openGitHub()    { vscode.postMessage({ type: 'openLink', url: 'https://github.com/NakedoMedia/shadow-accept' }); }
+function reportIssue()   { vscode.postMessage({ type: 'openLink', url: 'https://github.com/NakedoMedia/shadow-accept/issues' }); }
+function openWebsite()   { vscode.postMessage({ type: 'openLink', url: 'https://nakedo.ai' }); }
 
 // \u2500\u2500 Toast \u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500\u2500
 

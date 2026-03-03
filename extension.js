@@ -335,7 +335,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     <div class="header-logo">⚡</div>
     <div>
         <div class="header-title">Shadow Accept</div>
-        <div class="header-sub">by Nakedo Corp — MIT License — Free forever</div>
+        <div class="header-sub">by NakedoMedia — nakedo.ai — Free forever</div>
     </div>
 </div>
 
@@ -392,6 +392,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
 <div class="footer">
     <span class="footer-logo">NAKEDO CORP</span>
     <div class="footer-links">
+        <a onclick="openWebsite()">nakedo.ai</a>
         <a onclick="openGitHub()">GitHub</a>
         <a onclick="reportIssue()">Report issue</a>
     </div>
@@ -455,8 +456,9 @@ function resetDefaults() {
 }
 
 function showLog()       { vscode.postMessage({ type: 'openOutput' }); }
-function openGitHub()    { vscode.postMessage({ type: 'openLink', url: 'https://github.com/NakedoCorp/shadow-accept' }); }
-function reportIssue()   { vscode.postMessage({ type: 'openLink', url: 'https://github.com/NakedoCorp/shadow-accept/issues' }); }
+function openGitHub()    { vscode.postMessage({ type: 'openLink', url: 'https://github.com/NakedoMedia/shadow-accept' }); }
+function reportIssue()   { vscode.postMessage({ type: 'openLink', url: 'https://github.com/NakedoMedia/shadow-accept/issues' }); }
+function openWebsite()   { vscode.postMessage({ type: 'openLink', url: 'https://nakedo.ai' }); }
 
 // ── Toast ───────────────────────────────────────────────────────────────────
 

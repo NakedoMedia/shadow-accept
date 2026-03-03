@@ -1,7 +1,9 @@
 # ⚡ Shadow Accept
 
 **Auto-accept AI agent prompts in VS Code, Antigravity and Cursor.**
-by **Nakedo Corp** — MIT License — Free forever, no limits, no telemetry.
+by **[NakedoMedia](https://nakedo.ai)** — MIT License — Free forever, no limits, no telemetry.
+
+[nakedo.ai](https://nakedo.ai) · [GitHub](https://github.com/NakedoMedia/shadow-accept) · [Issues](https://github.com/NakedoMedia/shadow-accept/issues)
 
 ---
 
@@ -91,7 +93,7 @@ No network requests. No data collection. All processing is local.
 PRs welcome! See [CONTRIBUTING.md](CONTRIBUTING.md) or open an issue.
 
 ```bash
-git clone https://github.com/NakedoCorp/shadow-accept
+git clone https://github.com/NakedoMedia/shadow-accept
 cd shadow-accept
 npm install
 npm run compile
@@ -101,4 +103,4 @@ npm run compile
 
 ## License
 
-MIT © 2026 Nakedo Corp
+MIT © 2026 NakedoMedia
