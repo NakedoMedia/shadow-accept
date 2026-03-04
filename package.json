@@ -2,7 +2,7 @@
 	"name": "shadow-accept",
 	"displayName": "Shadow Accept",
 	"description": "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. 100% free, no limits, open source by NakedoMedia.",
-	"version": "1.0.0",
+	"version": "1.1.0",
 	"publisher": "NakedoMedia",
 	"license": "MIT",
 	"icon": "media/icon.png",
@@ -81,6 +81,13 @@
 					"type": "boolean",
 					"default": false,
 					"description": "Automatically enable Shadow Accept when VS Code starts"
+				},
+				"shadowAccept.debugPort": {
+					"type": "number",
+					"default": 0,
+					"minimum": 0,
+					"maximum": 65535,
+					"description": "Custom CDP debug port (0 = auto-scan common ports like 9222, 9229, 9000-9006)"
 				}
 			}
 		}

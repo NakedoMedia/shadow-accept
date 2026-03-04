@@ -1,9 +1,15 @@
 /**
- * Shadow Accept — DOM Injection Script
+ * Shadow Accept — DOM Injection Script v1.1
  * by Nakedo Corp — MIT License
  *
  * Injected into the IDE's Electron renderer via CDP.
  * Polls the DOM to find and click AI agent "accept" buttons.
+ *
+ * v1.1 fixes:
+ *  - Word-boundary matching (prevents "ok" matching "book", "run" matching "running")
+ *  - Shadow DOM traversal for modern IDE components
+ *  - Smarter button scoring (prefer exact matches over partial)
+ *  - aria-label / title attribute checking
  *
  * Global API (called from cdp-handler.js):
  *   window.__shadowAcceptStart(config)  — start/restart with config
@@ -25,7 +31,7 @@
     if (window.__shadowAcceptLoaded) return;
     window.__shadowAcceptLoaded = true;
 
-    console.log('[ShadowAccept] Script loaded');
+    console.log('[ShadowAccept] v1.1 Script loaded');
 
     // ── State ─────────────────────────────────────────────────────────────────
 
@@ -53,7 +59,7 @@
 
     const log = (msg) => console.log(`[ShadowAccept] ${msg}`);
 
-    // ── DOM traversal (including iframes) ────────────────────────────────────
+    // ── DOM traversal (including iframes and Shadow DOM) ──────────────────────
 
     function getAllDocuments(root = document) {
         const docs = [root];
@@ -68,11 +74,32 @@
         return docs;
     }
 
+    function querySelectorAllDeep(selector, root = document) {
+        const results = [];
+        try {
+            results.push(...Array.from(root.querySelectorAll(selector)));
+        } catch (_) {}
+
+        // Traverse Shadow DOM roots
+        try {
+            const allElements = root.querySelectorAll('*');
+            for (const el of allElements) {
+                if (el.shadowRoot) {
+                    try {
+                        results.push(...querySelectorAllDeep(selector, el.shadowRoot));
+                    } catch (_) {}
+                }
+            }
+        } catch (_) {}
+
+        return results;
+    }
+
     function queryAllDocs(selector) {
         const results = [];
         for (const doc of getAllDocuments()) {
             try {
-                results.push(...Array.from(doc.querySelectorAll(selector)));
+                results.push(...querySelectorAllDeep(selector, doc));
             } catch (_) {}
         }
         return results;
@@ -94,28 +121,45 @@
         return [
             'button',
             '[role="button"]',
-            '[class*="button"]',
-            '[class*="anysphere"]',
+            'a.monaco-button',
+            '.monaco-dialog button',
+            '.notification-list-item-buttons-container .monaco-button',
             '[class*="action-button"]',
+            '[class*="anysphere"]',
         ];
     }
 
-    // ── Text pattern matching ─────────────────────────────────────────────────
+    // ── Text pattern matching (word-boundary aware) ───────────────────────────
 
-    const ACCEPT_PATTERNS = [
-        'accept all', 'accept', 'apply all', 'apply', 'run', 'retry',
-        'execute', 'confirm', 'always allow', 'allow once', 'allow',
-        'approve', 'yes', 'ok', 'proceed', 'continue',
+    // Pre-compiled regexes for accept patterns (word boundaries)
+    const ACCEPT_REGEXES = [
+        /\baccept\s+all\b/,
+        /\baccept\b/,
+        /\bapply\s+all\b/,
+        /\bapply\b/,
+        /\bretry\b/,
+        /\bconfirm\b/,
+        /\balways\s+allow\b/,
+        /\ballow\s+once\b/,
+        /\ballow\b/,
+        /\bapprove\b/,
+        /\bproceed\b/,
+        /\bcontinue\b/,
+        /\brun\b/,
+        /\bexecute\b/,
+        /\byes\b/,
+        /\bok\b/,
     ];
 
-    const REJECT_PATTERNS = [
-        'skip', 'reject', 'cancel', 'close', 'refine', 'decline',
-        'deny', 'no', 'stop', 'abort', 'dismiss',
+    const REJECT_REGEXES = [
+        /\bskip\b/, /\breject\b/, /\bcancel\b/, /\bclose\b/,
+        /\brefine\b/, /\bdecline\b/, /\bdeny\b/, /\bno\b/,
+        /\bstop\b/, /\babort\b/, /\bdismiss\b/, /\bdon'?t\s+allow\b/,
     ];
 
-    function matchesPatterns(text, patterns) {
-        for (const p of patterns) {
-            if (text.includes(p)) return true;
+    function matchesAnyRegex(text, regexes) {
+        for (const re of regexes) {
+            if (re.test(text)) return true;
         }
         return false;
     }
@@ -202,24 +246,34 @@
         }
     }
 
-    function isAcceptButton(el) {
-        const rawText = (el.textContent || '').trim();
-        const text    = rawText.toLowerCase();
+    function getButtonText(el) {
+        // Check textContent, aria-label, and title
+        const text = (el.textContent || '').trim();
+        if (text.length > 0 && text.length <= 60) return text;
+        const aria = (el.getAttribute('aria-label') || '').trim();
+        if (aria.length > 0 && aria.length <= 60) return aria;
+        const title = (el.getAttribute('title') || '').trim();
+        if (title.length > 0 && title.length <= 60) return title;
+        return '';
+    }
 
-        // Ignore empty or very long text
-        if (text.length === 0 || rawText.length > 60) return false;
+    function isAcceptButton(el) {
+        const rawText = getButtonText(el);
+        if (!rawText) return false;
+
+        const text = rawText.toLowerCase();
 
         // Hard reject patterns first
-        if (matchesPatterns(text, REJECT_PATTERNS)) return false;
+        if (matchesAnyRegex(text, REJECT_REGEXES)) return false;
 
         // Must match at least one accept pattern
-        if (!matchesPatterns(text, ACCEPT_PATTERNS)) return false;
+        if (!matchesAnyRegex(text, ACCEPT_REGEXES)) return false;
 
         // Must be visible
         if (!isVisible(el)) return false;
 
         // Safety check for run/execute: inspect nearby command text
-        if (text.includes('run') || text.includes('execute')) {
+        if (/\b(run|execute)\b/.test(text)) {
             const cmd = extractNearbyCommandText(el);
             if (isBannedCommand(cmd)) return false;
         }
@@ -245,17 +299,26 @@
         if (!state.running || state.userInteracting) return;
 
         let clicked = 0;
+        const seen = new Set(); // prevent clicking same button via multiple selectors
+
         for (const selector of getButtonSelectors()) {
             for (const el of queryAllDocs(selector)) {
+                if (seen.has(el)) continue;
+                seen.add(el);
                 if (recentlyClicked.has(el)) continue;
                 if (!isAcceptButton(el)) continue;
 
-                const label = (el.textContent || '').trim();
+                const label = getButtonText(el);
                 log(`Clicking: "${label}"`);
 
-                el.dispatchEvent(new MouseEvent('click', {
-                    view: window, bubbles: true, cancelable: true,
-                }));
+                // Try native click first, then MouseEvent dispatch
+                try {
+                    el.click();
+                } catch (_) {
+                    el.dispatchEvent(new MouseEvent('click', {
+                        view: window, bubbles: true, cancelable: true,
+                    }));
+                }
 
                 markClicked(el);
                 state.clicks++;
@@ -296,9 +359,8 @@
         if (config.pollInterval)   state.pollInterval   = config.pollInterval;
         if (config.bannedCommands) state.bannedCommands = config.bannedCommands;
 
-        // If already running, just update config
+        // If already running, just update config (don't restart timer)
         if (state.running) {
-            log(`Config updated: ${JSON.stringify(config)}`);
             return;
         }
 

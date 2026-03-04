@@ -3643,10 +3643,36 @@ var require_cdp_handler = __commonJS({
     var http = require("http");
     var fs = require("fs");
     var path = require("path");
-    var CDP_BASE_PORT = 9e3;
-    var CDP_PORT_RANGE = 3;
-    var CONNECT_TIMEOUT_MS = 800;
+    var PRIORITY_PORTS = [
+      9222,
+      // Chrome / Electron default
+      9229,
+      // Node.js inspector default
+      9333,
+      // Cursor (some versions)
+      9e3,
+      9001,
+      9002,
+      9003,
+      // Previous Shadow Accept range
+      8997,
+      8998,
+      8999,
+      // Extended previous range
+      9004,
+      9005,
+      9006,
+      5858,
+      5859,
+      // Legacy Node.js debug
+      9230,
+      9231
+      // Additional inspector ports
+    ];
+    var CONNECT_TIMEOUT_MS = 600;
     var EVALUATE_TIMEOUT_MS = 2500;
+    var BACKOFF_BASE_MS = 2e3;
+    var BACKOFF_MAX_MS = 3e4;
     var _cachedScript = null;
     function loadAutoAcceptScript() {
       if (_cachedScript) return _cachedScript;
@@ -3666,25 +3692,66 @@ var require_cdp_handler = __commonJS({
         this._pages = /* @__PURE__ */ new Map();
         this._msgId = 1;
         this._running = false;
+        this._cachedPort = null;
+        this._failCount = 0;
+        this._lastScanTime = 0;
+        this._customPorts = [];
+        this.isConnected = false;
+        this.connectedPort = null;
+        this.pagesConnected = 0;
       }
       log(msg) {
         this._log(`[CDP] ${msg}`);
       }
+      /** Allow user to specify extra ports via settings. */
+      setCustomPorts(ports) {
+        this._customPorts = Array.isArray(ports) ? ports.filter((p) => Number.isInteger(p) && p > 0 && p < 65536) : [];
+      }
       // ── Public API ────────────────────────────────────────────────────────────
       /**
-       * Start (or refresh) connections to all IDE pages and inject the script.
-       * Safe to call repeatedly — already-injected pages are not re-injected.
+       * Start (or refresh) connections to IDE pages and inject the script.
+       * Uses smart port caching: tries cached port first, then full scan with backoff.
        */
       async start(config) {
         this._running = true;
-        for (let port = CDP_BASE_PORT - CDP_PORT_RANGE; port <= CDP_BASE_PORT + CDP_PORT_RANGE; port++) {
+        if (this._cachedPort) {
+          const pages = await this._listPages(this._cachedPort);
+          if (pages.length > 0) {
+            await this._connectAndInject(this._cachedPort, pages, config);
+            this._updateConnectionState();
+            return;
+          }
+          this.log(`Cached port ${this._cachedPort} no longer responding`);
+          this._cachedPort = null;
+        }
+        const backoffMs = Math.min(BACKOFF_BASE_MS * Math.pow(1.5, this._failCount), BACKOFF_MAX_MS);
+        const elapsed = Date.now() - this._lastScanTime;
+        if (this._failCount > 0 && elapsed < backoffMs) {
+          return;
+        }
+        this._lastScanTime = Date.now();
+        const portsToScan = this._getPortList();
+        let foundAny = false;
+        for (const port of portsToScan) {
           const pages = await this._listPages(port);
-          for (const page of pages) {
-            const key = `${port}:${page.id}`;
-            await this._ensureConnected(key, page.webSocketDebuggerUrl);
-            await this._ensureInjected(key, config);
+          if (pages.length > 0) {
+            this._cachedPort = port;
+            this._failCount = 0;
+            this.log(`Found CDP on port ${port} (${pages.length} page(s))`);
+            await this._connectAndInject(port, pages, config);
+            foundAny = true;
+            break;
           }
         }
+        if (!foundAny) {
+          this._failCount++;
+          if (this._failCount === 1) {
+            this.log(`No CDP port found. Scanning ${portsToScan.length} ports. Will retry with backoff.`);
+          } else if (this._failCount % 10 === 0) {
+            this.log(`Still no CDP port after ${this._failCount} scans. Ensure IDE is launched with --remote-debugging-port=9222`);
+          }
+        }
+        this._updateConnectionState();
       }
       /** Stop all connections and tell the injected script to stop. */
       async stop() {
@@ -3700,6 +3767,7 @@ var require_cdp_handler = __commonJS({
           }
         }
         this._pages.clear();
+        this._updateConnectionState();
       }
       /** Retrieve click/block counters from all connected pages. */
       async getStats() {
@@ -3718,6 +3786,35 @@ var require_cdp_handler = __commonJS({
         }
         return totals;
       }
+      // ── Internal helpers ──────────────────────────────────────────────────────
+      _getPortList() {
+        const seen = /* @__PURE__ */ new Set();
+        const list = [];
+        for (const p of [...this._customPorts, ...PRIORITY_PORTS]) {
+          if (!seen.has(p)) {
+            seen.add(p);
+            list.push(p);
+          }
+        }
+        return list;
+      }
+      async _connectAndInject(port, pages, config) {
+        for (const page of pages) {
+          const key = `${port}:${page.id}`;
+          await this._ensureConnected(key, page.webSocketDebuggerUrl);
+          await this._ensureInjected(key, config);
+        }
+      }
+      _updateConnectionState() {
+        for (const [key, conn] of this._pages) {
+          if (conn.ws.readyState !== WebSocket.OPEN) {
+            this._pages.delete(key);
+          }
+        }
+        this.pagesConnected = this._pages.size;
+        this.isConnected = this._pages.size > 0;
+        this.connectedPort = this.isConnected ? this._cachedPort : null;
+      }
       // ── Connection helpers ────────────────────────────────────────────────────
       /** GET /json/list from the Electron DevTools endpoint. Returns filtered pages. */
       async _listPages(port) {
@@ -3730,7 +3827,7 @@ var require_cdp_handler = __commonJS({
               res.on("end", () => {
                 try {
                   const pages = JSON.parse(body);
-                  resolve(pages.filter((p) => this._isTargetPage(p)));
+                  resolve(Array.isArray(pages) ? pages.filter((p) => this._isTargetPage(p)) : []);
                 } catch (_) {
                   resolve([]);
                 }
@@ -3758,7 +3855,9 @@ var require_cdp_handler = __commonJS({
         return true;
       }
       async _ensureConnected(key, wsUrl) {
-        if (this._pages.has(key)) return;
+        const existing = this._pages.get(key);
+        if (existing && existing.ws.readyState === WebSocket.OPEN) return;
+        if (existing) this._pages.delete(key);
         await new Promise((resolve) => {
           let settled = false;
           const done = (ok) => {
@@ -3856,125 +3955,23 @@ var require_cdp_handler = __commonJS({
   }
 });
 
-// package.json
-var require_package = __commonJS({
-  "package.json"(exports2, module2) {
-    module2.exports = {
-      name: "shadow-accept",
-      displayName: "Shadow Accept",
-      description: "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. 100% free, no limits, open source by NakedoMedia.",
-      version: "1.0.0",
-      publisher: "NakedoMedia",
-      license: "MIT",
-      icon: "media/icon.png",
-      repository: {
-        type: "git",
-        url: "git+https://github.com/NakedoMedia/shadow-accept.git"
-      },
-      categories: [
-        "Machine Learning",
-        "Other"
-      ],
-      keywords: [
-        "antigravity",
-        "cursor",
-        "vscode",
-        "ai",
-        "auto-accept",
-        "agent",
-        "copilot",
-        "claude"
-      ],
-      engines: {
-        vscode: "^1.75.0"
-      },
-      activationEvents: [
-        "onStartupFinished"
-      ],
-      main: "dist/extension.js",
-      scripts: {
-        compile: "npx esbuild extension.js --bundle --outfile=dist/extension.js --external:vscode --platform=node --format=cjs",
-        package: "npx vsce package",
-        test: "node test/test.js"
-      },
-      contributes: {
-        commands: [
-          {
-            command: "shadow-accept.toggle",
-            title: "Shadow Accept: Toggle ON/OFF"
-          },
-          {
-            command: "shadow-accept.openSettings",
-            title: "Shadow Accept: Settings"
-          }
-        ],
-        configuration: {
-          title: "Shadow Accept",
-          properties: {
-            "shadowAccept.pollInterval": {
-              type: "number",
-              default: 800,
-              minimum: 300,
-              maximum: 5e3,
-              description: "Polling interval in milliseconds (how often to scan for accept buttons)"
-            },
-            "shadowAccept.bannedCommands": {
-              type: "array",
-              items: {
-                type: "string"
-              },
-              default: [
-                "rm -rf /",
-                "rm -rf ~",
-                "rm -rf *",
-                "format c:",
-                "del /f /s /q",
-                "rmdir /s /q",
-                ":(){:|:&};:",
-                "dd if=",
-                "mkfs.",
-                "> /dev/sda",
-                "chmod -R 777 /"
-              ],
-              description: "Command patterns that will never be auto-accepted. Supports plain substrings or /regex/flags."
-            },
-            "shadowAccept.enableOnStartup": {
-              type: "boolean",
-              default: false,
-              description: "Automatically enable Shadow Accept when VS Code starts"
-            }
-          }
-        }
-      },
-      devDependencies: {
-        esbuild: "^0.27.3"
-      },
-      dependencies: {
-        ws: "^8.19.0"
-      },
-      author: "",
-      type: "commonjs",
-      bugs: {
-        url: "https://github.com/NakedoMedia/shadow-accept/issues"
-      },
-      homepage: "https://github.com/NakedoMedia/shadow-accept#readme"
-    };
-  }
-});
-
 // extension.js
 var vscode = require("vscode");
 var { CDPHandler } = require_cdp_handler();
 var STATE_ENABLED_KEY = "shadow-accept.enabled";
 var STATE_TOTAL_CLICKS = "shadow-accept.totalClicks";
+var DISCOVERY_INTERVAL_MS = 3e3;
+var STATS_INTERVAL_MS = 1500;
 var isEnabled = false;
-var pollTimer = null;
+var discoveryTimer = null;
+var statsTimer = null;
 var statusBarItem = null;
 var outputChannel = null;
 var cdpHandler = null;
 var globalContext = null;
 var currentIDE = "Code";
 var sessionClicks = 0;
+var hasShownCDPHelp = false;
 function log(msg) {
   const ts = (/* @__PURE__ */ new Date()).toISOString().split("T")[1].split(".")[0];
   const line = `[${ts}] ${msg}`;
@@ -3985,6 +3982,7 @@ function detectIDE() {
   const name = (vscode.env.appName || "").toLowerCase();
   if (name.includes("cursor")) return "Cursor";
   if (name.includes("antigravity")) return "Antigravity";
+  if (name.includes("windsurf")) return "Windsurf";
   return "Code";
 }
 function getConfig() {
@@ -3992,7 +3990,8 @@ function getConfig() {
   return {
     pollInterval: cfg.get("pollInterval", 800),
     bannedCommands: cfg.get("bannedCommands", getDefaultBannedCommands()),
-    enableOnStartup: cfg.get("enableOnStartup", false)
+    enableOnStartup: cfg.get("enableOnStartup", false),
+    debugPort: cfg.get("debugPort", 0)
   };
 }
 function getDefaultBannedCommands() {
@@ -4015,11 +4014,23 @@ function updateStatusBar() {
   const totalClicks = (globalContext?.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + sessionClicks;
   const clickLabel = totalClicks > 0 ? ` (${formatCount(totalClicks)})` : "";
   if (isEnabled) {
-    statusBarItem.text = `$(check) Shadow${clickLabel}`;
-    statusBarItem.tooltip = `Shadow Accept is ON \u2014 ${totalClicks} auto-accepted total
+    const connected = cdpHandler?.isConnected;
+    if (connected) {
+      const port = cdpHandler.connectedPort ? `:${cdpHandler.connectedPort}` : "";
+      statusBarItem.text = `$(check) Shadow${clickLabel}`;
+      statusBarItem.tooltip = `Shadow Accept is ON \u2014 Connected${port}
+${totalClicks} auto-accepted total
 Click to disable`;
-    statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
-    statusBarItem.color = void 0;
+      statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
+      statusBarItem.color = void 0;
+    } else {
+      statusBarItem.text = `$(sync~spin) Shadow`;
+      statusBarItem.tooltip = `Shadow Accept is ON \u2014 Searching for CDP...
+Ensure IDE was launched with --remote-debugging-port=9222
+Click to disable`;
+      statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
+      statusBarItem.color = void 0;
+    }
   } else {
     statusBarItem.text = `$(circle-slash) Shadow`;
     statusBarItem.tooltip = `Shadow Accept is OFF
@@ -4032,35 +4043,86 @@ function formatCount(n) {
   if (n >= 1e3) return `${(n / 1e3).toFixed(1)}k`;
   return String(n);
 }
-async function runPollCycle() {
+function showCDPHelpIfNeeded() {
+  if (hasShownCDPHelp || !isEnabled || !cdpHandler) return;
+  if (cdpHandler.isConnected) return;
+  setTimeout(() => {
+    if (hasShownCDPHelp || !isEnabled || cdpHandler?.isConnected) return;
+    hasShownCDPHelp = true;
+    const ide = currentIDE;
+    let helpMsg;
+    if (ide === "Cursor") {
+      helpMsg = "Shadow Accept needs Cursor's debug port. Try launching Cursor with: cursor --remote-debugging-port=9222";
+    } else if (ide === "Antigravity") {
+      helpMsg = "Shadow Accept needs Antigravity's debug port. Try launching with: antigravity --remote-debugging-port=9222";
+    } else {
+      helpMsg = "Shadow Accept needs VS Code's debug port. Launch VS Code with: code --remote-debugging-port=9222";
+    }
+    vscode.window.showWarningMessage(
+      helpMsg,
+      "Copy command",
+      "Set custom port",
+      "View log"
+    ).then((choice) => {
+      if (choice === "Copy command") {
+        const cmd = ide === "Cursor" ? "cursor" : ide === "Antigravity" ? "antigravity" : "code";
+        vscode.env.clipboard.writeText(`${cmd} --remote-debugging-port=9222`);
+        vscode.window.showInformationMessage("Command copied! Restart your IDE with this flag.");
+      }
+      if (choice === "Set custom port") {
+        vscode.commands.executeCommand("workbench.action.openSettings", "shadowAccept.debugPort");
+      }
+      if (choice === "View log") {
+        outputChannel?.show(true);
+      }
+    });
+  }, 8e3);
+}
+async function runDiscoveryCycle() {
   if (!isEnabled || !cdpHandler) return;
   const cfg = getConfig();
+  if (cfg.debugPort > 0) {
+    cdpHandler.setCustomPorts([cfg.debugPort]);
+  }
   try {
     await cdpHandler.start({
       ide: currentIDE,
       pollInterval: cfg.pollInterval,
       bannedCommands: cfg.bannedCommands
     });
+  } catch (e) {
+    log(`[Discovery] ${e.message}`);
+  }
+  updateStatusBar();
+}
+async function runStatsCycle() {
+  if (!isEnabled || !cdpHandler || !cdpHandler.isConnected) return;
+  try {
     const stats = await cdpHandler.getStats();
     if (stats.clicks !== sessionClicks) {
       sessionClicks = stats.clicks;
       updateStatusBar();
     }
   } catch (e) {
-    log(`[Poll] ${e.message}`);
+    log(`[Stats] ${e.message}`);
   }
 }
 function startPolling() {
   stopPolling();
-  const { pollInterval } = getConfig();
-  log(`Polling every ${pollInterval}ms on ${currentIDE}`);
-  runPollCycle();
-  pollTimer = setInterval(runPollCycle, pollInterval);
+  log(`Starting \u2014 discovery every ${DISCOVERY_INTERVAL_MS}ms, stats every ${STATS_INTERVAL_MS}ms on ${currentIDE}`);
+  runDiscoveryCycle();
+  discoveryTimer = setInterval(runDiscoveryCycle, DISCOVERY_INTERVAL_MS);
+  statsTimer = setInterval(runStatsCycle, STATS_INTERVAL_MS);
+  showCDPHelpIfNeeded();
 }
 function stopPolling() {
-  if (pollTimer) {
-    clearInterval(pollTimer);
-    pollTimer = null;
+  if (discoveryTimer) {
+    clearInterval(discoveryTimer);
+    discoveryTimer = null;
+  }
+  if (statsTimer) {
+    clearInterval(statsTimer);
+    statsTimer = null;
   }
   cdpHandler?.stop().catch(() => {
   });
@@ -4071,6 +4133,7 @@ async function cmdToggle(context) {
   updateStatusBar();
   if (isEnabled) {
     log("Enabled");
+    hasShownCDPHelp = false;
     startPolling();
     vscode.window.showInformationMessage(
       `$(check) Shadow Accept is ON`,
@@ -4101,26 +4164,47 @@ function cmdOpenSettings(context) {
   const cfg = getConfig();
   const bannedStr = cfg.bannedCommands.join("\n");
   const totalClicks = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + sessionClicks;
-  panel.webview.html = buildSettingsHTML(cfg, bannedStr, totalClicks, currentIDE, isEnabled);
+  const connected = cdpHandler?.isConnected ?? false;
+  const port = cdpHandler?.connectedPort ?? null;
+  panel.webview.html = buildSettingsHTML(cfg, bannedStr, totalClicks, currentIDE, isEnabled, connected, port);
   panel.webview.onDidReceiveMessage(async (msg) => {
     switch (msg.type) {
       case "getStats": {
         const stats = cdpHandler ? await cdpHandler.getStats() : { clicks: 0, blocked: 0, uptime: 0 };
         const total = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + stats.clicks;
-        panel.webview.postMessage({ type: "stats", ...stats, total, enabled: isEnabled, ide: currentIDE });
+        panel.webview.postMessage({
+          type: "stats",
+          ...stats,
+          total,
+          enabled: isEnabled,
+          ide: currentIDE,
+          connected: cdpHandler?.isConnected ?? false,
+          port: cdpHandler?.connectedPort ?? null
+        });
         break;
       }
       case "toggle": {
         await cmdToggle(context);
         const stats2 = cdpHandler ? await cdpHandler.getStats() : { clicks: 0, blocked: 0 };
         const total2 = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + stats2.clicks;
-        panel.webview.postMessage({ type: "stats", ...stats2, total: total2, enabled: isEnabled, ide: currentIDE });
+        panel.webview.postMessage({
+          type: "stats",
+          ...stats2,
+          total: total2,
+          enabled: isEnabled,
+          ide: currentIDE,
+          connected: cdpHandler?.isConnected ?? false,
+          port: cdpHandler?.connectedPort ?? null
+        });
         break;
       }
       case "save": {
         const wcfg = vscode.workspace.getConfiguration("shadowAccept");
         await wcfg.update("pollInterval", msg.pollInterval, vscode.ConfigurationTarget.Global);
         await wcfg.update("bannedCommands", msg.bannedCommands, vscode.ConfigurationTarget.Global);
+        if (msg.debugPort !== void 0) {
+          await wcfg.update("debugPort", msg.debugPort, vscode.ConfigurationTarget.Global);
+        }
         if (isEnabled) startPolling();
         panel.webview.postMessage({ type: "saved" });
         log(`Settings saved \u2014 pollInterval=${msg.pollInterval}ms, banned=${msg.bannedCommands.length}`);
@@ -4133,7 +4217,9 @@ function cmdOpenSettings(context) {
     }
   }, void 0, context.subscriptions);
 }
-function buildSettingsHTML(cfg, bannedStr, totalClicks, ide, enabled) {
+function buildSettingsHTML(cfg, bannedStr, totalClicks, ide, enabled, connected, port) {
+  const connLabel = connected ? `Connected on port ${port}` : "Not connected \u2014 see log";
+  const connClass = connected ? "conn-ok" : "conn-err";
   return (
     /* html */
     `<!DOCTYPE html>
@@ -4155,6 +4241,7 @@ function buildSettingsHTML(cfg, bannedStr, totalClicks, ide, enabled) {
     --accent:   #7c6af7;
     --green:    #22c55e;
     --red:      #f87171;
+    --orange:   #fb923c;
     --font:     var(--vscode-font-family, system-ui, sans-serif);
     --mono:     var(--vscode-editor-font-family, 'Courier New', monospace);
 }
@@ -4178,6 +4265,19 @@ body {
 }
 .header-title { font-size: 22px; font-weight: 700; letter-spacing: -0.4px; }
 .header-sub { font-size: 12px; opacity: 0.5; margin-top: 2px; }
+
+/* \u2500\u2500 Connection status \u2500\u2500 */
+.conn-badge {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 5px 12px; border-radius: 6px; font-size: 11px; font-weight: 600;
+    margin-bottom: 16px;
+}
+.conn-badge.conn-ok { background: rgba(34,197,94,.1); color: var(--green); border: 1px solid rgba(34,197,94,.2); }
+.conn-badge.conn-err { background: rgba(248,113,113,.08); color: var(--orange); border: 1px solid rgba(248,113,113,.15); }
+.conn-dot { width: 7px; height: 7px; border-radius: 50%; }
+.conn-ok .conn-dot { background: var(--green); }
+.conn-err .conn-dot { background: var(--orange); animation: pulse 1.5s infinite; }
+@keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
 /* \u2500\u2500 Toggle button \u2500\u2500 */
 .toggle-btn {
@@ -4217,6 +4317,13 @@ input[type=range] { width: 100%; cursor: pointer; accent-color: var(--accent); }
 .range-row { display: flex; align-items: center; gap: 12px; }
 .range-val { font-size: 13px; font-weight: 600; min-width: 44px; text-align: right; opacity: .85; }
 
+input[type=number] {
+    width: 100px; background: var(--input-bg); color: var(--fg);
+    border: 1px solid var(--input-bd); border-radius: 6px;
+    padding: 6px 10px; font-size: 13px; font-family: var(--mono);
+}
+input[type=number]:focus { outline: none; border-color: var(--accent); }
+
 textarea {
     width: 100%; min-height: 130px; resize: vertical;
     background: var(--input-bg); color: var(--fg);
@@ -4250,6 +4357,17 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
 }
 .toast.show { opacity: 1; transform: translateY(0); }
 
+/* \u2500\u2500 Help box \u2500\u2500 */
+.help-box {
+    padding: 12px 16px; border-radius: 8px; font-size: 12px; line-height: 1.6;
+    background: rgba(124,106,247,.06); border: 1px solid rgba(124,106,247,.15);
+    margin-bottom: 24px;
+}
+.help-box code {
+    background: rgba(255,255,255,.08); padding: 2px 6px; border-radius: 3px;
+    font-family: var(--mono); font-size: 11px;
+}
+
 /* \u2500\u2500 Footer \u2500\u2500 */
 .footer { margin-top: 32px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,.06); display: flex; justify-content: space-between; align-items: center; }
 .footer-logo { font-size: 11px; opacity: .35; font-weight: 600; letter-spacing: .3px; }
@@ -4261,11 +4379,17 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
 <body>
 
 <div class="header">
-    <div class="header-logo">\u26A1</div>
+    <div class="header-logo">&#9889;</div>
     <div>
         <div class="header-title">Shadow Accept</div>
         <div class="header-sub">by NakedoMedia \u2014 nakedo.ai \u2014 Free forever</div>
     </div>
+</div>
+
+<!-- Connection status -->
+<div class="conn-badge ${connClass}" id="connBadge">
+    <span class="conn-dot"></span>
+    <span id="connLabel">${connLabel}</span>
 </div>
 
 <!-- Toggle -->
@@ -4289,6 +4413,21 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
         <div class="stat-val" id="statBlocked">0</div>
         <div class="stat-lbl">Blocked commands</div>
     </div>
+</div>
+
+<!-- Help box (shown when not connected) -->
+<div class="help-box" id="helpBox" style="${connected ? "display:none" : ""}">
+    <strong>Not connected?</strong> Launch your IDE with the debug flag:<br>
+    <code>${ide === "Cursor" ? "cursor" : ide === "Antigravity" ? "antigravity" : "code"} --remote-debugging-port=9222</code><br>
+    Or set a custom port below if your IDE uses a different one.
+</div>
+
+<!-- Debug port -->
+<div class="section">
+    <div class="section-title">Connection</div>
+    <label for="debugPort">Custom debug port (0 = auto-scan)</label>
+    <input type="number" id="debugPort" min="0" max="65535" value="${cfg.debugPort || 0}">
+    <p class="hint">If your IDE uses a specific debug port, set it here for faster connection. Leave 0 for automatic scanning.</p>
 </div>
 
 <!-- Poll interval -->
@@ -4347,9 +4486,27 @@ window.addEventListener('message', e => {
         btn.className = 'toggle-btn ' + (on ? 'on' : 'off');
         document.getElementById('toggleLabel').textContent = on ? 'Auto Accept is ON' : 'Auto Accept is OFF';
         document.getElementById('toggleIde').textContent   = m.ide || '';
+
+        // Update connection badge
+        const badge = document.getElementById('connBadge');
+        const label = document.getElementById('connLabel');
+        const helpBox = document.getElementById('helpBox');
+        if (m.connected) {
+            badge.className = 'conn-badge conn-ok';
+            label.textContent = 'Connected on port ' + (m.port || '?');
+            helpBox.style.display = 'none';
+        } else if (on) {
+            badge.className = 'conn-badge conn-err';
+            label.textContent = 'Searching for CDP...';
+            helpBox.style.display = '';
+        } else {
+            badge.className = 'conn-badge conn-err';
+            label.textContent = 'Disabled';
+            helpBox.style.display = 'none';
+        }
     }
     if (m.type === 'saved') {
-        showToast('Settings saved \u2713');
+        showToast('Settings saved');
     }
 });
 
@@ -4369,6 +4526,7 @@ function save() {
     vscode.postMessage({
         type:           'save',
         pollInterval:   parseInt(document.getElementById('pollRange').value, 10),
+        debugPort:      parseInt(document.getElementById('debugPort').value, 10) || 0,
         bannedCommands: document.getElementById('bannedArea').value
             .split('\\n').map(s => s.trim()).filter(Boolean),
     });
@@ -4376,6 +4534,7 @@ function save() {
 
 function resetDefaults() {
     document.getElementById('pollRange').value = 800;
+    document.getElementById('debugPort').value = 0;
     updatePollLabel();
     document.getElementById('bannedArea').value = [
         'rm -rf /', 'rm -rf ~', 'rm -rf *', 'format c:',
@@ -4408,13 +4567,16 @@ async function activate(context) {
   currentIDE = detectIDE();
   outputChannel = vscode.window.createOutputChannel("Shadow Accept");
   context.subscriptions.push(outputChannel);
-  log(`Shadow Accept activating on ${currentIDE} (v${require_package().version})`);
+  log(`Shadow Accept v1.1 activating on ${currentIDE}`);
   cdpHandler = new CDPHandler(log);
+  const cfg = getConfig();
+  if (cfg.debugPort > 0) {
+    cdpHandler.setCustomPorts([cfg.debugPort]);
+  }
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBarItem.command = "shadow-accept.toggle";
   context.subscriptions.push(statusBarItem);
   statusBarItem.show();
-  const cfg = getConfig();
   isEnabled = context.globalState.get(STATE_ENABLED_KEY, cfg.enableOnStartup);
   updateStatusBar();
   if (isEnabled) {
@@ -4427,9 +4589,15 @@ async function activate(context) {
   );
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
-      if (e.affectsConfiguration("shadowAccept") && isEnabled) {
-        log("Config changed \u2192 restarting poll");
-        startPolling();
+      if (e.affectsConfiguration("shadowAccept")) {
+        const newCfg = getConfig();
+        if (newCfg.debugPort > 0) {
+          cdpHandler.setCustomPorts([newCfg.debugPort]);
+        }
+        if (isEnabled) {
+          log("Config changed, restarting poll");
+          startPolling();
+        }
       }
     })
   );

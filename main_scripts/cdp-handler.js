@@ -1,10 +1,15 @@
 /**
- * Shadow Accept — CDP Handler
+ * Shadow Accept — CDP Handler v1.1
  * by Nakedo Corp — MIT License
  *
  * Connects to the Electron DevTools Protocol (CDP) of VS Code / Antigravity / Cursor
- * via WebSocket on the local debug port (9000–9006), then injects and controls the
- * auto_accept.js DOM script.
+ * via WebSocket, then injects and controls the auto_accept.js DOM script.
+ *
+ * v1.1 fixes:
+ *  - Smart port discovery: common ports (9222, 9229) + configurable + wide scan
+ *  - Port caching: once found, reuse until disconnected
+ *  - Backoff: exponential delay when no CDP port is found
+ *  - Connection state: isConnected / connectedPort exposed for status bar
  *
  * Security notes:
  *  - Only connects to 127.0.0.1 (loopback). Never to remote hosts.
@@ -21,10 +26,25 @@ const http      = require('http');
 const fs        = require('fs');
 const path      = require('path');
 
-const CDP_BASE_PORT  = 9000;
-const CDP_PORT_RANGE = 3;          // scan 9000 ± 3
-const CONNECT_TIMEOUT_MS  = 800;
+// ─── Port discovery ───────────────────────────────────────────────────────────
+// Priority-ordered list of ports to scan.
+// Common Electron/Chrome DevTools ports first, then a wider sweep.
+
+const PRIORITY_PORTS = [
+    9222,                    // Chrome / Electron default
+    9229,                    // Node.js inspector default
+    9333,                    // Cursor (some versions)
+    9000, 9001, 9002, 9003, // Previous Shadow Accept range
+    8997, 8998, 8999,       // Extended previous range
+    9004, 9005, 9006,
+    5858, 5859,             // Legacy Node.js debug
+    9230, 9231,             // Additional inspector ports
+];
+
+const CONNECT_TIMEOUT_MS  = 600;
 const EVALUATE_TIMEOUT_MS = 2500;
+const BACKOFF_BASE_MS     = 2000;
+const BACKOFF_MAX_MS      = 30000;
 
 // ─── Script loader (cached) ───────────────────────────────────────────────────
 
@@ -47,30 +67,86 @@ class CDPHandler {
      * @param {(msg: string) => void} logger
      */
     constructor(logger = console.log) {
-        this._log     = logger;
-        this._pages   = new Map();   // key: "port:pageId" → { ws, injected, config }
-        this._msgId   = 1;
-        this._running = false;
+        this._log            = logger;
+        this._pages          = new Map();   // key: "port:pageId" → { ws, injected, config }
+        this._msgId          = 1;
+        this._running        = false;
+
+        // Port caching & backoff
+        this._cachedPort     = null;        // last working port
+        this._failCount      = 0;           // consecutive scan failures
+        this._lastScanTime   = 0;           // timestamp of last full scan
+        this._customPorts    = [];          // user-configured extra ports
+
+        // Public state
+        this.isConnected     = false;
+        this.connectedPort   = null;
+        this.pagesConnected  = 0;
     }
 
     log(msg) { this._log(`[CDP] ${msg}`); }
 
+    /** Allow user to specify extra ports via settings. */
+    setCustomPorts(ports) {
+        this._customPorts = Array.isArray(ports) ? ports.filter(p => Number.isInteger(p) && p > 0 && p < 65536) : [];
+    }
+
     // ── Public API ────────────────────────────────────────────────────────────
 
     /**
-     * Start (or refresh) connections to all IDE pages and inject the script.
-     * Safe to call repeatedly — already-injected pages are not re-injected.
+     * Start (or refresh) connections to IDE pages and inject the script.
+     * Uses smart port caching: tries cached port first, then full scan with backoff.
      */
     async start(config) {
         this._running = true;
-        for (let port = CDP_BASE_PORT - CDP_PORT_RANGE; port <= CDP_BASE_PORT + CDP_PORT_RANGE; port++) {
+
+        // 1. If we have a cached port, try it first (fast path)
+        if (this._cachedPort) {
+            const pages = await this._listPages(this._cachedPort);
+            if (pages.length > 0) {
+                await this._connectAndInject(this._cachedPort, pages, config);
+                this._updateConnectionState();
+                return;
+            }
+            // Cached port stopped working
+            this.log(`Cached port ${this._cachedPort} no longer responding`);
+            this._cachedPort = null;
+        }
+
+        // 2. Check if we should do a full scan (with backoff)
+        const backoffMs = Math.min(BACKOFF_BASE_MS * Math.pow(1.5, this._failCount), BACKOFF_MAX_MS);
+        const elapsed   = Date.now() - this._lastScanTime;
+        if (this._failCount > 0 && elapsed < backoffMs) {
+            return; // Still in backoff period
+        }
+
+        // 3. Full port scan
+        this._lastScanTime = Date.now();
+        const portsToScan  = this._getPortList();
+
+        let foundAny = false;
+        for (const port of portsToScan) {
             const pages = await this._listPages(port);
-            for (const page of pages) {
-                const key = `${port}:${page.id}`;
-                await this._ensureConnected(key, page.webSocketDebuggerUrl);
-                await this._ensureInjected(key, config);
+            if (pages.length > 0) {
+                this._cachedPort = port;
+                this._failCount  = 0;
+                this.log(`Found CDP on port ${port} (${pages.length} page(s))`);
+                await this._connectAndInject(port, pages, config);
+                foundAny = true;
+                break; // Use first working port
             }
         }
+
+        if (!foundAny) {
+            this._failCount++;
+            if (this._failCount === 1) {
+                this.log(`No CDP port found. Scanning ${portsToScan.length} ports. Will retry with backoff.`);
+            } else if (this._failCount % 10 === 0) {
+                this.log(`Still no CDP port after ${this._failCount} scans. Ensure IDE is launched with --remote-debugging-port=9222`);
+            }
+        }
+
+        this._updateConnectionState();
     }
 
     /** Stop all connections and tell the injected script to stop. */
@@ -83,6 +159,7 @@ class CDPHandler {
             try { conn.ws.close(); } catch (_) {}
         }
         this._pages.clear();
+        this._updateConnectionState();
     }
 
     /** Retrieve click/block counters from all connected pages. */
@@ -100,6 +177,38 @@ class CDPHandler {
         return totals;
     }
 
+    // ── Internal helpers ──────────────────────────────────────────────────────
+
+    _getPortList() {
+        // Custom ports first, then priority ports, deduplicated
+        const seen = new Set();
+        const list = [];
+        for (const p of [...this._customPorts, ...PRIORITY_PORTS]) {
+            if (!seen.has(p)) { seen.add(p); list.push(p); }
+        }
+        return list;
+    }
+
+    async _connectAndInject(port, pages, config) {
+        for (const page of pages) {
+            const key = `${port}:${page.id}`;
+            await this._ensureConnected(key, page.webSocketDebuggerUrl);
+            await this._ensureInjected(key, config);
+        }
+    }
+
+    _updateConnectionState() {
+        // Remove dead connections
+        for (const [key, conn] of this._pages) {
+            if (conn.ws.readyState !== WebSocket.OPEN) {
+                this._pages.delete(key);
+            }
+        }
+        this.pagesConnected = this._pages.size;
+        this.isConnected    = this._pages.size > 0;
+        this.connectedPort  = this.isConnected ? this._cachedPort : null;
+    }
+
     // ── Connection helpers ────────────────────────────────────────────────────
 
     /** GET /json/list from the Electron DevTools endpoint. Returns filtered pages. */
@@ -113,7 +222,7 @@ class CDPHandler {
                     res.on('end', () => {
                         try {
                             const pages = JSON.parse(body);
-                            resolve(pages.filter(p => this._isTargetPage(p)));
+                            resolve(Array.isArray(pages) ? pages.filter(p => this._isTargetPage(p)) : []);
                         } catch (_) { resolve([]); }
                     });
                 }
@@ -138,7 +247,11 @@ class CDPHandler {
     }
 
     async _ensureConnected(key, wsUrl) {
-        if (this._pages.has(key)) return;
+        const existing = this._pages.get(key);
+        if (existing && existing.ws.readyState === WebSocket.OPEN) return;
+        // Clean up stale entry
+        if (existing) this._pages.delete(key);
+
         await new Promise((resolve) => {
             let settled = false;
             const done = (ok) => { if (!settled) { settled = true; resolve(ok); } };
