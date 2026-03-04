@@ -4,6 +4,222 @@ var __commonJS = (cb, mod) => function __require() {
   return mod || (0, cb[__getOwnPropNames(cb)[0]])((mod = { exports: {} }).exports, mod), mod.exports;
 };
 
+// main_scripts/terminal-monitor.js
+var require_terminal_monitor = __commonJS({
+  "main_scripts/terminal-monitor.js"(exports2, module2) {
+    "use strict";
+    function stripAnsi(text) {
+      if (!text) return "";
+      return text.replace(/\x1B\[[0-9;]*[a-zA-Z]/g, "").replace(/\x1B\][^\x07]*\x07/g, "").replace(/\x1B\][^\x1B]*\x1B\\/g, "").replace(/\x1B[()][A-Z0-9]/g, "").replace(/\x1B[#=]/g, "").replace(/[\x00-\x08\x0E-\x1A\x1C-\x1F]/g, "").replace(/\r/g, "");
+    }
+    var PROMPT_PATTERNS = [
+      // Claude Code CLI: "Allow Bash(npm test)? [Y/n]"
+      {
+        name: "claude-code-allow",
+        pattern: /Allow\s+\w+\(.*?\)\?\s*\[Y\/n\]/,
+        response: "Y\n",
+        hasTool: true
+      },
+      // Claude Code CLI: "Do you want to proceed? [Y/n]"
+      {
+        name: "claude-code-proceed",
+        pattern: /Do you want to proceed\?\s*\[Y\/n\]/i,
+        response: "Y\n",
+        hasTool: false
+      },
+      // Generic [Y/n] at end of line
+      {
+        name: "generic-yn",
+        pattern: /\[Y\/n\]\s*$/,
+        response: "Y\n",
+        hasTool: false
+      },
+      // Generic [y/N] at end of line
+      {
+        name: "generic-yN",
+        pattern: /\[y\/N\]\s*$/,
+        response: "y\n",
+        hasTool: false
+      },
+      // Generic (yes/no) prompt
+      {
+        name: "generic-yesno",
+        pattern: /\(yes\/no\)\s*:?\s*$/i,
+        response: "yes\n",
+        hasTool: false
+      },
+      // Generic (y/n) prompt
+      {
+        name: "generic-yn-paren",
+        pattern: /\(y\/n\)\s*:?\s*$/i,
+        response: "y\n",
+        hasTool: false
+      },
+      // Press Enter to continue
+      {
+        name: "press-enter",
+        pattern: /Press Enter to continue/i,
+        response: "\n",
+        hasTool: false
+      }
+    ];
+    function extractCommandFromPrompt(text) {
+      const match = text.match(/Allow\s+(\w+)\((.+?)\)\?/);
+      if (!match) return null;
+      return { tool: match[1], command: match[2] };
+    }
+    var DANGEROUS_TOOLS = ["Bash", "Execute", "Shell", "Run"];
+    var TerminalMonitorEngine = class {
+      constructor(logger, vscodeApi) {
+        this._log = logger;
+        this._vscode = vscodeApi;
+        this._running = false;
+        this._available = false;
+        this._disposables = [];
+        this._buffers = /* @__PURE__ */ new Map();
+        this._cooldowns = /* @__PURE__ */ new Map();
+        this._flushTimers = /* @__PURE__ */ new Map();
+        this._bannedCommands = [];
+        this._customPatterns = [];
+        this._cooldownMs = 1e3;
+        this._stats = { clicks: 0, blocked: 0, lastAction: null };
+        this.isActive = false;
+      }
+      // ── Public API ────────────────────────────────────────────────────────────
+      start(config) {
+        this._bannedCommands = config.bannedCommands || [];
+        this._customPatterns = (config.terminalPatterns || []).map((p) => {
+          try {
+            return { name: "custom", pattern: new RegExp(p), response: "Y\n", hasTool: false };
+          } catch (_) {
+            return null;
+          }
+        }).filter(Boolean);
+        if (this._running) return;
+        this._running = true;
+        try {
+          if (this._vscode.window.onDidWriteTerminalData) {
+            const disposable = this._vscode.window.onDidWriteTerminalData((event) => {
+              this._onTerminalData(event);
+            });
+            this._disposables.push(disposable);
+            this._available = true;
+            this.isActive = true;
+            this._log("[Terminal] Engine started \u2014 onDidWriteTerminalData available");
+          } else {
+            this._log("[Terminal] Proposed API not available (onDidWriteTerminalData is undefined)");
+          }
+        } catch (e) {
+          this._log(`[Terminal] Proposed API not available: ${e.message}`);
+        }
+      }
+      stop() {
+        this._running = false;
+        this.isActive = false;
+        for (const d of this._disposables) {
+          try {
+            d.dispose();
+          } catch (_) {
+          }
+        }
+        this._disposables = [];
+        for (const timer of this._flushTimers.values()) {
+          clearTimeout(timer);
+        }
+        this._buffers.clear();
+        this._cooldowns.clear();
+        this._flushTimers.clear();
+        this._log("[Terminal] Engine stopped");
+      }
+      getStats() {
+        return { ...this._stats };
+      }
+      // ── Terminal data handler ─────────────────────────────────────────────────
+      _onTerminalData(event) {
+        if (!this._running) return;
+        const { terminal, data } = event;
+        const cleaned = stripAnsi(data);
+        if (!cleaned) return;
+        const existing = this._buffers.get(terminal) || "";
+        const combined = existing + cleaned;
+        const lines = combined.split("\n");
+        const lastLine = lines[lines.length - 1];
+        this._buffers.set(terminal, lastLine);
+        if (lastLine.length > 2) {
+          this._detectPrompt(lastLine, terminal);
+        }
+        clearTimeout(this._flushTimers.get(terminal));
+        this._flushTimers.set(terminal, setTimeout(() => {
+          this._buffers.delete(terminal);
+        }, 2e3));
+      }
+      // ── Prompt detection ──────────────────────────────────────────────────────
+      _detectPrompt(text, terminal) {
+        const lastResponse = this._cooldowns.get(terminal) || 0;
+        if (Date.now() - lastResponse < this._cooldownMs) return;
+        const allPatterns = [...PROMPT_PATTERNS, ...this._customPatterns];
+        for (const p of allPatterns) {
+          if (p.pattern.test(text)) {
+            this._respondToPrompt(terminal, p, text);
+            return;
+          }
+        }
+      }
+      _respondToPrompt(terminal, pattern, matchedText) {
+        if (pattern.hasTool) {
+          const extracted = extractCommandFromPrompt(matchedText);
+          if (extracted && DANGEROUS_TOOLS.includes(extracted.tool)) {
+            if (this._isBannedCommand(extracted.command)) {
+              this._log(`[Terminal] BLOCKED: ${extracted.tool}(${extracted.command})`);
+              this._stats.blocked++;
+              return;
+            }
+          }
+        }
+        try {
+          terminal.sendText(pattern.response, false);
+        } catch (e) {
+          this._log(`[Terminal] sendText failed: ${e.message}`);
+          return;
+        }
+        this._cooldowns.set(terminal, Date.now());
+        this._stats.clicks++;
+        this._stats.lastAction = { text: pattern.name, time: (/* @__PURE__ */ new Date()).toISOString() };
+        this._log(`[Terminal] Auto-accepted: "${pattern.name}" \u2192 sent "${pattern.response.trim()}"`);
+      }
+      // ── Banned command check ──────────────────────────────────────────────────
+      _isBannedCommand(commandText) {
+        if (!commandText || this._bannedCommands.length === 0) return false;
+        const lower = commandText.toLowerCase();
+        for (const pattern of this._bannedCommands) {
+          const p = (pattern || "").trim();
+          if (!p) continue;
+          try {
+            if (p.startsWith("/") && p.lastIndexOf("/") > 0) {
+              const last = p.lastIndexOf("/");
+              const regex = new RegExp(p.slice(1, last), p.slice(last + 1) || "i");
+              if (regex.test(commandText)) return true;
+            } else if (lower.includes(p.toLowerCase())) {
+              return true;
+            }
+          } catch (_) {
+            if (lower.includes(p.toLowerCase())) return true;
+          }
+        }
+        return false;
+      }
+    };
+    module2.exports = {
+      TerminalMonitorEngine,
+      // Exported for testing
+      stripAnsi,
+      PROMPT_PATTERNS,
+      DANGEROUS_TOOLS,
+      extractCommandFromPrompt
+    };
+  }
+});
+
 // node_modules/ws/lib/constants.js
 var require_constants = __commonJS({
   "node_modules/ws/lib/constants.js"(exports2, module2) {
@@ -3683,7 +3899,7 @@ var require_cdp_handler = __commonJS({
       _cachedScript = fs.readFileSync(scriptPath, "utf8");
       return _cachedScript;
     }
-    var CDPHandler2 = class {
+    var CDPHandler = class {
       /**
        * @param {(msg: string) => void} logger
        */
@@ -3951,13 +4167,97 @@ var require_cdp_handler = __commonJS({
         }
       }
     };
-    module2.exports = { CDPHandler: CDPHandler2 };
+    module2.exports = { CDPHandler };
+  }
+});
+
+// main_scripts/engine-manager.js
+var require_engine_manager = __commonJS({
+  "main_scripts/engine-manager.js"(exports2, module2) {
+    "use strict";
+    var { TerminalMonitorEngine } = require_terminal_monitor();
+    var { CDPHandler } = require_cdp_handler();
+    var EngineManager2 = class {
+      /**
+       * @param {(msg: string) => void} logger
+       * @param {object} vscodeApi  — the `vscode` module, injected for testability
+       */
+      constructor(logger, vscodeApi) {
+        this._log = logger;
+        this._vscode = vscodeApi;
+        this._terminal = new TerminalMonitorEngine(logger, vscodeApi);
+        this._cdp = new CDPHandler(logger);
+        this._mode = "auto";
+        this._running = false;
+      }
+      // ── Public state ─────────────────────────────────────────────────────────
+      get isConnected() {
+        return this._terminal.isActive || this._cdp.isConnected;
+      }
+      get primaryEngine() {
+        if (this._terminal.isActive && this._cdp.isConnected) return "terminal+cdp";
+        if (this._terminal.isActive) return "terminal";
+        if (this._cdp.isConnected) return "cdp";
+        return "none";
+      }
+      get connectedPort() {
+        return this._cdp.connectedPort;
+      }
+      get cdp() {
+        return this._cdp;
+      }
+      get terminal() {
+        return this._terminal;
+      }
+      // ── Public API ───────────────────────────────────────────────────────────
+      start(config) {
+        this._running = true;
+        this._mode = config.engineMode || "auto";
+        if (this._mode !== "cdp-only") {
+          this._terminal.start(config);
+        }
+        return this;
+      }
+      /**
+       * Start CDP engine. Separated because CDP discovery is async.
+       * Called from the extension's discovery polling loop.
+       */
+      async startCDP(config) {
+        if (this._mode === "terminal-only") return;
+        await this._cdp.start(config);
+      }
+      async stop() {
+        this._running = false;
+        this._terminal.stop();
+        await this._cdp.stop();
+      }
+      /** Aggregate stats from both engines. */
+      async getStats() {
+        const cdpStats = await this._cdp.getStats();
+        const termStats = this._terminal.getStats();
+        return {
+          clicks: (termStats.clicks || 0) + (cdpStats.clicks || 0),
+          blocked: (termStats.blocked || 0) + (cdpStats.blocked || 0),
+          terminalClicks: termStats.clicks || 0,
+          cdpClicks: cdpStats.clicks || 0,
+          lastAction: termStats.lastAction || cdpStats.lastAction || null,
+          terminalActive: this._terminal.isActive,
+          cdpConnected: this._cdp.isConnected,
+          engine: this.primaryEngine
+        };
+      }
+      /** Forward custom ports to CDP handler. */
+      setCustomPorts(ports) {
+        this._cdp.setCustomPorts(ports);
+      }
+    };
+    module2.exports = { EngineManager: EngineManager2 };
   }
 });
 
 // extension.js
 var vscode = require("vscode");
-var { CDPHandler } = require_cdp_handler();
+var { EngineManager } = require_engine_manager();
 var STATE_ENABLED_KEY = "shadow-accept.enabled";
 var STATE_TOTAL_CLICKS = "shadow-accept.totalClicks";
 var DISCOVERY_INTERVAL_MS = 3e3;
@@ -3967,7 +4267,7 @@ var discoveryTimer = null;
 var statsTimer = null;
 var statusBarItem = null;
 var outputChannel = null;
-var cdpHandler = null;
+var engineManager = null;
 var globalContext = null;
 var currentIDE = "Code";
 var sessionClicks = 0;
@@ -3991,7 +4291,9 @@ function getConfig() {
     pollInterval: cfg.get("pollInterval", 800),
     bannedCommands: cfg.get("bannedCommands", getDefaultBannedCommands()),
     enableOnStartup: cfg.get("enableOnStartup", false),
-    debugPort: cfg.get("debugPort", 0)
+    debugPort: cfg.get("debugPort", 0),
+    engineMode: cfg.get("engineMode", "auto"),
+    terminalPatterns: cfg.get("terminalPatterns", [])
   };
 }
 function getDefaultBannedCommands() {
@@ -4014,19 +4316,19 @@ function updateStatusBar() {
   const totalClicks = (globalContext?.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + sessionClicks;
   const clickLabel = totalClicks > 0 ? ` (${formatCount(totalClicks)})` : "";
   if (isEnabled) {
-    const connected = cdpHandler?.isConnected;
+    const connected = engineManager?.isConnected;
     if (connected) {
-      const port = cdpHandler.connectedPort ? `:${cdpHandler.connectedPort}` : "";
+      const engine = engineManager.primaryEngine;
+      const engineLabel = engine === "terminal+cdp" ? "Terminal+CDP" : engine === "terminal" ? "Terminal" : engine === "cdp" ? `CDP:${engineManager.connectedPort || "?"}` : "";
       statusBarItem.text = `$(check) Shadow${clickLabel}`;
-      statusBarItem.tooltip = `Shadow Accept is ON \u2014 Connected${port}
+      statusBarItem.tooltip = `Shadow Accept is ON \u2014 ${engineLabel}
 ${totalClicks} auto-accepted total
 Click to disable`;
       statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.warningBackground");
       statusBarItem.color = void 0;
     } else {
       statusBarItem.text = `$(sync~spin) Shadow`;
-      statusBarItem.tooltip = `Shadow Accept is ON \u2014 Searching for CDP...
-Ensure IDE was launched with --remote-debugging-port=9222
+      statusBarItem.tooltip = `Shadow Accept is ON \u2014 Searching for engines...
 Click to disable`;
       statusBarItem.backgroundColor = new vscode.ThemeColor("statusBarItem.errorBackground");
       statusBarItem.color = void 0;
@@ -4044,19 +4346,24 @@ function formatCount(n) {
   return String(n);
 }
 function showCDPHelpIfNeeded() {
-  if (hasShownCDPHelp || !isEnabled || !cdpHandler) return;
-  if (cdpHandler.isConnected) return;
+  if (hasShownCDPHelp || !isEnabled || !engineManager) return;
+  if (engineManager.terminal.isActive) return;
+  if (engineManager.cdp.isConnected) return;
   setTimeout(() => {
-    if (hasShownCDPHelp || !isEnabled || cdpHandler?.isConnected) return;
+    if (hasShownCDPHelp || !isEnabled) return;
+    if (engineManager?.terminal.isActive || engineManager?.cdp.isConnected) return;
     hasShownCDPHelp = true;
     const ide = currentIDE;
+    const cfg = getConfig();
     let helpMsg;
-    if (ide === "Cursor") {
-      helpMsg = "Shadow Accept needs Cursor's debug port. Try launching Cursor with: cursor --remote-debugging-port=9222";
+    if (cfg.engineMode === "terminal-only") {
+      helpMsg = "Shadow Accept terminal monitor needs the proposed onDidWriteTerminalData API. This works best with sideloaded extensions.";
+    } else if (ide === "Cursor") {
+      helpMsg = "Shadow Accept: Terminal monitor unavailable. For CDP fallback, launch Cursor with: cursor --remote-debugging-port=9222";
     } else if (ide === "Antigravity") {
-      helpMsg = "Shadow Accept needs Antigravity's debug port. Try launching with: antigravity --remote-debugging-port=9222";
+      helpMsg = "Shadow Accept: Terminal monitor unavailable. For CDP fallback, launch with: antigravity --remote-debugging-port=9222";
     } else {
-      helpMsg = "Shadow Accept needs VS Code's debug port. Launch VS Code with: code --remote-debugging-port=9222";
+      helpMsg = "Shadow Accept: Terminal monitor unavailable. For CDP fallback, launch VS Code with: code --remote-debugging-port=9222";
     }
     vscode.window.showWarningMessage(
       helpMsg,
@@ -4078,14 +4385,24 @@ function showCDPHelpIfNeeded() {
     });
   }, 8e3);
 }
+function cmdQuickAccept() {
+  const terminal = vscode.window.activeTerminal;
+  if (terminal) {
+    terminal.sendText("Y", false);
+    terminal.sendText("\n", false);
+    log("[QuickAccept] Sent Y to active terminal");
+  } else {
+    vscode.window.showWarningMessage("No active terminal found.");
+  }
+}
 async function runDiscoveryCycle() {
-  if (!isEnabled || !cdpHandler) return;
+  if (!isEnabled || !engineManager) return;
   const cfg = getConfig();
   if (cfg.debugPort > 0) {
-    cdpHandler.setCustomPorts([cfg.debugPort]);
+    engineManager.setCustomPorts([cfg.debugPort]);
   }
   try {
-    await cdpHandler.start({
+    await engineManager.startCDP({
       ide: currentIDE,
       pollInterval: cfg.pollInterval,
       bannedCommands: cfg.bannedCommands
@@ -4096,9 +4413,9 @@ async function runDiscoveryCycle() {
   updateStatusBar();
 }
 async function runStatsCycle() {
-  if (!isEnabled || !cdpHandler || !cdpHandler.isConnected) return;
+  if (!isEnabled || !engineManager || !engineManager.isConnected) return;
   try {
-    const stats = await cdpHandler.getStats();
+    const stats = await engineManager.getStats();
     if (stats.clicks !== sessionClicks) {
       sessionClicks = stats.clicks;
       updateStatusBar();
@@ -4109,11 +4426,14 @@ async function runStatsCycle() {
 }
 function startPolling() {
   stopPolling();
-  log(`Starting \u2014 discovery every ${DISCOVERY_INTERVAL_MS}ms, stats every ${STATS_INTERVAL_MS}ms on ${currentIDE}`);
+  const cfg = getConfig();
+  log(`Starting v1.2 \u2014 mode=${cfg.engineMode}, discovery every ${DISCOVERY_INTERVAL_MS}ms, stats every ${STATS_INTERVAL_MS}ms on ${currentIDE}`);
+  engineManager.start(cfg);
   runDiscoveryCycle();
   discoveryTimer = setInterval(runDiscoveryCycle, DISCOVERY_INTERVAL_MS);
   statsTimer = setInterval(runStatsCycle, STATS_INTERVAL_MS);
   showCDPHelpIfNeeded();
+  updateStatusBar();
 }
 function stopPolling() {
   if (discoveryTimer) {
@@ -4124,7 +4444,7 @@ function stopPolling() {
     clearInterval(statsTimer);
     statsTimer = null;
   }
-  cdpHandler?.stop().catch(() => {
+  engineManager?.stop().catch(() => {
   });
 }
 async function cmdToggle(context) {
@@ -4164,13 +4484,15 @@ function cmdOpenSettings(context) {
   const cfg = getConfig();
   const bannedStr = cfg.bannedCommands.join("\n");
   const totalClicks = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + sessionClicks;
-  const connected = cdpHandler?.isConnected ?? false;
-  const port = cdpHandler?.connectedPort ?? null;
-  panel.webview.html = buildSettingsHTML(cfg, bannedStr, totalClicks, currentIDE, isEnabled, connected, port);
+  const engine = engineManager?.primaryEngine ?? "none";
+  const termActive = engineManager?.terminal.isActive ?? false;
+  const cdpConn = engineManager?.cdp.isConnected ?? false;
+  const port = engineManager?.connectedPort ?? null;
+  panel.webview.html = buildSettingsHTML(cfg, bannedStr, totalClicks, currentIDE, isEnabled, engine, termActive, cdpConn, port);
   panel.webview.onDidReceiveMessage(async (msg) => {
     switch (msg.type) {
       case "getStats": {
-        const stats = cdpHandler ? await cdpHandler.getStats() : { clicks: 0, blocked: 0, uptime: 0 };
+        const stats = engineManager ? await engineManager.getStats() : { clicks: 0, blocked: 0, terminalClicks: 0, cdpClicks: 0, engine: "none" };
         const total = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + stats.clicks;
         panel.webview.postMessage({
           type: "stats",
@@ -4178,14 +4500,16 @@ function cmdOpenSettings(context) {
           total,
           enabled: isEnabled,
           ide: currentIDE,
-          connected: cdpHandler?.isConnected ?? false,
-          port: cdpHandler?.connectedPort ?? null
+          connected: engineManager?.isConnected ?? false,
+          port: engineManager?.connectedPort ?? null,
+          terminalActive: stats.terminalActive ?? false,
+          cdpConnected: stats.cdpConnected ?? false
         });
         break;
       }
       case "toggle": {
         await cmdToggle(context);
-        const stats2 = cdpHandler ? await cdpHandler.getStats() : { clicks: 0, blocked: 0 };
+        const stats2 = engineManager ? await engineManager.getStats() : { clicks: 0, blocked: 0, terminalClicks: 0, cdpClicks: 0, engine: "none" };
         const total2 = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + stats2.clicks;
         panel.webview.postMessage({
           type: "stats",
@@ -4193,8 +4517,10 @@ function cmdOpenSettings(context) {
           total: total2,
           enabled: isEnabled,
           ide: currentIDE,
-          connected: cdpHandler?.isConnected ?? false,
-          port: cdpHandler?.connectedPort ?? null
+          connected: engineManager?.isConnected ?? false,
+          port: engineManager?.connectedPort ?? null,
+          terminalActive: stats2.terminalActive ?? false,
+          cdpConnected: stats2.cdpConnected ?? false
         });
         break;
       }
@@ -4205,9 +4531,12 @@ function cmdOpenSettings(context) {
         if (msg.debugPort !== void 0) {
           await wcfg.update("debugPort", msg.debugPort, vscode.ConfigurationTarget.Global);
         }
+        if (msg.engineMode !== void 0) {
+          await wcfg.update("engineMode", msg.engineMode, vscode.ConfigurationTarget.Global);
+        }
         if (isEnabled) startPolling();
         panel.webview.postMessage({ type: "saved" });
-        log(`Settings saved \u2014 pollInterval=${msg.pollInterval}ms, banned=${msg.bannedCommands.length}`);
+        log(`Settings saved \u2014 pollInterval=${msg.pollInterval}ms, mode=${msg.engineMode}, banned=${msg.bannedCommands.length}`);
         break;
       }
       case "openOutput": {
@@ -4217,9 +4546,15 @@ function cmdOpenSettings(context) {
     }
   }, void 0, context.subscriptions);
 }
-function buildSettingsHTML(cfg, bannedStr, totalClicks, ide, enabled, connected, port) {
-  const connLabel = connected ? `Connected on port ${port}` : "Not connected \u2014 see log";
-  const connClass = connected ? "conn-ok" : "conn-err";
+function buildSettingsHTML(cfg, bannedStr, totalClicks, ide, enabled, engine, termActive, cdpConn, port) {
+  const engineLabels = {
+    "terminal+cdp": "Terminal + CDP",
+    "terminal": "Terminal Monitor",
+    "cdp": `CDP on port ${port || "?"}`,
+    "none": "No engine connected"
+  };
+  const connLabel = engineLabels[engine] || "No engine connected";
+  const connClass = engine !== "none" ? "conn-ok" : "conn-err";
   return (
     /* html */
     `<!DOCTYPE html>
@@ -4279,6 +4614,17 @@ body {
 .conn-err .conn-dot { background: var(--orange); animation: pulse 1.5s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
+/* \u2500\u2500 Engine cards \u2500\u2500 */
+.engine-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+.engine-card {
+    padding: 10px 14px; border-radius: 8px; font-size: 12px;
+    background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
+}
+.engine-card.active { border-color: var(--green); background: rgba(34,197,94,.04); }
+.engine-card .engine-name { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
+.engine-card .engine-status { opacity: 0.5; font-size: 11px; }
+.engine-card.active .engine-status { color: var(--green); opacity: 1; }
+
 /* \u2500\u2500 Toggle button \u2500\u2500 */
 .toggle-btn {
     display: flex; align-items: center; gap: 10px;
@@ -4296,7 +4642,7 @@ body {
 .toggle-ide { font-size: 11px; opacity: 0.5; font-weight: 400; }
 
 /* \u2500\u2500 Stats row \u2500\u2500 */
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 28px; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
 .stat-card {
     padding: 14px 16px; border-radius: 8px;
     background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
@@ -4306,6 +4652,7 @@ body {
 .stat-card.green .stat-val { color: var(--green); }
 .stat-card.red   .stat-val { color: var(--red); }
 .stat-card.acc   .stat-val { color: var(--accent); }
+.stat-card.blue  .stat-val { color: #60a5fa; }
 
 /* \u2500\u2500 Sections \u2500\u2500 */
 .section { margin-bottom: 24px; }
@@ -4323,6 +4670,13 @@ input[type=number] {
     padding: 6px 10px; font-size: 13px; font-family: var(--mono);
 }
 input[type=number]:focus { outline: none; border-color: var(--accent); }
+
+select {
+    background: var(--input-bg); color: var(--fg);
+    border: 1px solid var(--input-bd); border-radius: 6px;
+    padding: 6px 10px; font-size: 13px; font-family: var(--font);
+}
+select:focus { outline: none; border-color: var(--accent); }
 
 textarea {
     width: 100%; min-height: 130px; resize: vertical;
@@ -4368,6 +4722,17 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     font-family: var(--mono); font-size: 11px;
 }
 
+/* \u2500\u2500 Shortcut hint \u2500\u2500 */
+.shortcut-box {
+    padding: 10px 14px; border-radius: 8px; font-size: 12px;
+    background: rgba(124,106,247,.04); border: 1px solid rgba(124,106,247,.1);
+    margin-bottom: 24px; display: flex; align-items: center; gap: 8px;
+}
+.shortcut-box kbd {
+    background: rgba(255,255,255,.1); padding: 2px 8px; border-radius: 4px;
+    font-family: var(--mono); font-size: 11px; border: 1px solid rgba(255,255,255,.15);
+}
+
 /* \u2500\u2500 Footer \u2500\u2500 */
 .footer { margin-top: 32px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,.06); display: flex; justify-content: space-between; align-items: center; }
 .footer-logo { font-size: 11px; opacity: .35; font-weight: 600; letter-spacing: .3px; }
@@ -4392,12 +4757,29 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     <span id="connLabel">${connLabel}</span>
 </div>
 
+<!-- Engine cards -->
+<div class="engine-row">
+    <div class="engine-card ${termActive ? "active" : ""}" id="termCard">
+        <div class="engine-name">Terminal Monitor</div>
+        <div class="engine-status" id="termStatus">${termActive ? "Active \u2014 zero config" : "Inactive"}</div>
+    </div>
+    <div class="engine-card ${cdpConn ? "active" : ""}" id="cdpCard">
+        <div class="engine-name">CDP Engine</div>
+        <div class="engine-status" id="cdpStatus">${cdpConn ? "Connected on port " + port : "Not connected"}</div>
+    </div>
+</div>
+
 <!-- Toggle -->
 <button class="toggle-btn ${enabled ? "on" : "off"}" id="toggleBtn" onclick="toggleAccept()">
     <span class="dot" id="dot"></span>
     <span class="toggle-label" id="toggleLabel">${enabled ? "Auto Accept is ON" : "Auto Accept is OFF"}</span>
     <span class="toggle-ide" id="toggleIde">${ide}</span>
 </button>
+
+<!-- Quick Accept hint -->
+<div class="shortcut-box">
+    <kbd>Ctrl+Shift+Y</kbd> Quick Accept \u2014 sends Y to active terminal instantly
+</div>
 
 <!-- Stats -->
 <div class="stats">
@@ -4409,17 +4791,33 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
         <div class="stat-val" id="statTotal">${totalClicks}</div>
         <div class="stat-lbl">All-time accepts</div>
     </div>
+    <div class="stat-card blue">
+        <div class="stat-val" id="statTerminal">0</div>
+        <div class="stat-lbl">Terminal accepts</div>
+    </div>
     <div class="stat-card red">
         <div class="stat-val" id="statBlocked">0</div>
         <div class="stat-lbl">Blocked commands</div>
     </div>
 </div>
 
-<!-- Help box (shown when not connected) -->
-<div class="help-box" id="helpBox" style="${connected ? "display:none" : ""}">
-    <strong>Not connected?</strong> Launch your IDE with the debug flag:<br>
-    <code>${ide === "Cursor" ? "cursor" : ide === "Antigravity" ? "antigravity" : "code"} --remote-debugging-port=9222</code><br>
-    Or set a custom port below if your IDE uses a different one.
+<!-- Help box (shown when no engine connected) -->
+<div class="help-box" id="helpBox" style="${engine !== "none" ? "display:none" : ""}">
+    <strong>No engine connected?</strong><br>
+    The <strong>Terminal Monitor</strong> works automatically with sideloaded VSIX extensions.<br>
+    For CDP fallback, launch your IDE with: <code>${ide === "Cursor" ? "cursor" : ide === "Antigravity" ? "antigravity" : "code"} --remote-debugging-port=9222</code>
+</div>
+
+<!-- Engine mode -->
+<div class="section">
+    <div class="section-title">Engine</div>
+    <label for="engineMode">Engine mode</label>
+    <select id="engineMode">
+        <option value="auto" ${cfg.engineMode === "auto" ? "selected" : ""}>Auto (terminal + CDP)</option>
+        <option value="terminal-only" ${cfg.engineMode === "terminal-only" ? "selected" : ""}>Terminal only</option>
+        <option value="cdp-only" ${cfg.engineMode === "cdp-only" ? "selected" : ""}>CDP only (v1.1 behavior)</option>
+    </select>
+    <p class="hint">Auto: terminal monitor first (zero-config), CDP as fallback. Terminal-only skips CDP. CDP-only requires debug port.</p>
 </div>
 
 <!-- Debug port -->
@@ -4427,7 +4825,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     <div class="section-title">Connection</div>
     <label for="debugPort">Custom debug port (0 = auto-scan)</label>
     <input type="number" id="debugPort" min="0" max="65535" value="${cfg.debugPort || 0}">
-    <p class="hint">If your IDE uses a specific debug port, set it here for faster connection. Leave 0 for automatic scanning.</p>
+    <p class="hint">If your IDE uses a specific debug port, set it here for faster CDP connection. Leave 0 for automatic scanning.</p>
 </div>
 
 <!-- Poll interval -->
@@ -4438,7 +4836,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
         <input type="range" id="pollRange" min="300" max="3000" step="100" value="${cfg.pollInterval}" oninput="updatePollLabel()">
         <span class="range-val" id="pollLabel">${cfg.pollInterval} ms</span>
     </div>
-    <p class="hint">How often Shadow Accept scans for buttons. 300ms = fastest \xB7 3000ms = most conservative. Default: 800ms.</p>
+    <p class="hint">How often Shadow Accept scans for buttons (CDP engine). Terminal engine responds instantly. Default: 800ms.</p>
 </div>
 
 <!-- Banned commands -->
@@ -4447,7 +4845,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     <label for="bannedArea">Banned command patterns</label>
     <textarea id="bannedArea" placeholder="One pattern per line.
 Supports /regex/flags syntax.">${bannedStr}</textarea>
-    <p class="hint">Run/execute buttons are <strong>never</strong> clicked if the nearby terminal command matches one of these patterns.</p>
+    <p class="hint">Run/execute buttons and terminal commands matching these patterns will <strong>never</strong> be auto-accepted.</p>
 </div>
 
 <!-- Actions -->
@@ -4478,9 +4876,10 @@ let refreshInterval;
 window.addEventListener('message', e => {
     const m = e.data;
     if (m.type === 'stats') {
-        document.getElementById('statClicks').textContent  = m.clicks  ?? 0;
-        document.getElementById('statBlocked').textContent = m.blocked ?? 0;
-        document.getElementById('statTotal').textContent   = m.total   ?? 0;
+        document.getElementById('statClicks').textContent   = m.clicks   ?? 0;
+        document.getElementById('statBlocked').textContent  = m.blocked  ?? 0;
+        document.getElementById('statTotal').textContent    = m.total    ?? 0;
+        document.getElementById('statTerminal').textContent = m.terminalClicks ?? 0;
         const on = !!m.enabled;
         const btn = document.getElementById('toggleBtn');
         btn.className = 'toggle-btn ' + (on ? 'on' : 'off');
@@ -4491,18 +4890,44 @@ window.addEventListener('message', e => {
         const badge = document.getElementById('connBadge');
         const label = document.getElementById('connLabel');
         const helpBox = document.getElementById('helpBox');
-        if (m.connected) {
+        const engine = m.engine || 'none';
+        if (engine !== 'none') {
             badge.className = 'conn-badge conn-ok';
-            label.textContent = 'Connected on port ' + (m.port || '?');
+            const labels = {
+                'terminal+cdp': 'Terminal + CDP',
+                'terminal': 'Terminal Monitor',
+                'cdp': 'CDP on port ' + (m.port || '?'),
+            };
+            label.textContent = labels[engine] || engine;
             helpBox.style.display = 'none';
         } else if (on) {
             badge.className = 'conn-badge conn-err';
-            label.textContent = 'Searching for CDP...';
+            label.textContent = 'Searching for engines...';
             helpBox.style.display = '';
         } else {
             badge.className = 'conn-badge conn-err';
             label.textContent = 'Disabled';
             helpBox.style.display = 'none';
+        }
+
+        // Update engine cards
+        const termCard = document.getElementById('termCard');
+        const cdpCard = document.getElementById('cdpCard');
+        const termStatus = document.getElementById('termStatus');
+        const cdpStatus = document.getElementById('cdpStatus');
+        if (m.terminalActive) {
+            termCard.classList.add('active');
+            termStatus.textContent = 'Active \u2014 zero config';
+        } else {
+            termCard.classList.remove('active');
+            termStatus.textContent = 'Inactive';
+        }
+        if (m.cdpConnected) {
+            cdpCard.classList.add('active');
+            cdpStatus.textContent = 'Connected on port ' + (m.port || '?');
+        } else {
+            cdpCard.classList.remove('active');
+            cdpStatus.textContent = 'Not connected';
         }
     }
     if (m.type === 'saved') {
@@ -4527,6 +4952,7 @@ function save() {
         type:           'save',
         pollInterval:   parseInt(document.getElementById('pollRange').value, 10),
         debugPort:      parseInt(document.getElementById('debugPort').value, 10) || 0,
+        engineMode:     document.getElementById('engineMode').value,
         bannedCommands: document.getElementById('bannedArea').value
             .split('\\n').map(s => s.trim()).filter(Boolean),
     });
@@ -4535,6 +4961,7 @@ function save() {
 function resetDefaults() {
     document.getElementById('pollRange').value = 800;
     document.getElementById('debugPort').value = 0;
+    document.getElementById('engineMode').value = 'auto';
     updatePollLabel();
     document.getElementById('bannedArea').value = [
         'rm -rf /', 'rm -rf ~', 'rm -rf *', 'format c:',
@@ -4567,11 +4994,11 @@ async function activate(context) {
   currentIDE = detectIDE();
   outputChannel = vscode.window.createOutputChannel("Shadow Accept");
   context.subscriptions.push(outputChannel);
-  log(`Shadow Accept v1.1 activating on ${currentIDE}`);
-  cdpHandler = new CDPHandler(log);
+  log(`Shadow Accept v1.2 activating on ${currentIDE}`);
+  engineManager = new EngineManager(log, vscode);
   const cfg = getConfig();
   if (cfg.debugPort > 0) {
-    cdpHandler.setCustomPorts([cfg.debugPort]);
+    engineManager.setCustomPorts([cfg.debugPort]);
   }
   statusBarItem = vscode.window.createStatusBarItem(vscode.StatusBarAlignment.Right, 100);
   statusBarItem.command = "shadow-accept.toggle";
@@ -4585,14 +5012,15 @@ async function activate(context) {
   }
   context.subscriptions.push(
     vscode.commands.registerCommand("shadow-accept.toggle", () => cmdToggle(context)),
-    vscode.commands.registerCommand("shadow-accept.openSettings", () => cmdOpenSettings(context))
+    vscode.commands.registerCommand("shadow-accept.openSettings", () => cmdOpenSettings(context)),
+    vscode.commands.registerCommand("shadow-accept.quickAccept", () => cmdQuickAccept())
   );
   context.subscriptions.push(
     vscode.workspace.onDidChangeConfiguration((e) => {
       if (e.affectsConfiguration("shadowAccept")) {
         const newCfg = getConfig();
         if (newCfg.debugPort > 0) {
-          cdpHandler.setCustomPorts([newCfg.debugPort]);
+          engineManager.setCustomPorts([newCfg.debugPort]);
         }
         if (isEnabled) {
           log("Config changed, restarting poll");

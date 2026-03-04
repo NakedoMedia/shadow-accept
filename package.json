@@ -1,8 +1,8 @@
 {
 	"name": "shadow-accept",
 	"displayName": "Shadow Accept",
-	"description": "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. 100% free, no limits, open source by NakedoMedia.",
-	"version": "1.1.0",
+	"description": "Auto-accept AI agent prompts in VS Code, Antigravity and Cursor. Zero-config terminal monitor + CDP fallback. 100% free, no limits, open source by NakedoMedia.",
+	"version": "1.2.0",
 	"publisher": "NakedoMedia",
 	"license": "MIT",
 	"icon": "media/icon.png",
@@ -22,11 +22,16 @@
 		"auto-accept",
 		"agent",
 		"copilot",
-		"claude"
+		"claude",
+		"terminal",
+		"zero-config"
 	],
 	"engines": {
-		"vscode": "^1.75.0"
+		"vscode": "^1.83.0"
 	},
+	"enabledApiProposals": [
+		"terminalDataWriteEvent"
+	],
 	"activationEvents": [
 		"onStartupFinished"
 	],
@@ -45,6 +50,18 @@
 			{
 				"command": "shadow-accept.openSettings",
 				"title": "Shadow Accept: Settings"
+			},
+			{
+				"command": "shadow-accept.quickAccept",
+				"title": "Shadow Accept: Quick Accept (send Y to terminal)"
+			}
+		],
+		"keybindings": [
+			{
+				"command": "shadow-accept.quickAccept",
+				"key": "ctrl+shift+y",
+				"mac": "cmd+shift+y",
+				"when": "terminalFocus"
 			}
 		],
 		"configuration": {
@@ -55,7 +72,7 @@
 					"default": 800,
 					"minimum": 300,
 					"maximum": 5000,
-					"description": "Polling interval in milliseconds (how often to scan for accept buttons)"
+					"description": "Polling interval in milliseconds (how often to scan for accept buttons via CDP engine)"
 				},
 				"shadowAccept.bannedCommands": {
 					"type": "array",
@@ -88,6 +105,29 @@
 					"minimum": 0,
 					"maximum": 65535,
 					"description": "Custom CDP debug port (0 = auto-scan common ports like 9222, 9229, 9000-9006)"
+				},
+				"shadowAccept.engineMode": {
+					"type": "string",
+					"default": "auto",
+					"enum": [
+						"auto",
+						"terminal-only",
+						"cdp-only"
+					],
+					"enumDescriptions": [
+						"Try terminal monitor first (zero-config), use CDP as fallback",
+						"Terminal monitor only, skip CDP engine",
+						"CDP only (v1.1 behavior, requires --remote-debugging-port)"
+					],
+					"description": "Engine mode: auto (recommended), terminal-only, or cdp-only"
+				},
+				"shadowAccept.terminalPatterns": {
+					"type": "array",
+					"items": {
+						"type": "string"
+					},
+					"default": [],
+					"description": "Additional regex patterns to match in terminal output. Each pattern triggers an auto-accept (Y) response."
 				}
 			}
 		}

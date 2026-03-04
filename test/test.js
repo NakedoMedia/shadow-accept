@@ -1,8 +1,8 @@
 /**
- * Shadow Accept — Unit Tests v1.1
+ * Shadow Accept — Unit Tests v1.2
  * by Nakedo Corp — MIT License
  *
- * Tests CDP handler logic and auto_accept pattern matching.
+ * Tests CDP handler, auto_accept patterns, terminal monitor, and engine manager.
  * Run: node test/test.js
  */
 
@@ -82,13 +82,13 @@ test('CDPHandler._getPortList returns custom ports first', () => {
     handler.setCustomPorts([1234]);
     const ports = handler._getPortList();
     assert.strictEqual(ports[0], 1234);
-    assert.ok(ports.includes(9222)); // Also includes standard ports
+    assert.ok(ports.includes(9222));
     assert.ok(ports.includes(9229));
 });
 
 test('CDPHandler._getPortList deduplicates ports', () => {
     const handler = new CDPHandler(() => {});
-    handler.setCustomPorts([9222, 9229]); // These are already in PRIORITY_PORTS
+    handler.setCustomPorts([9222, 9229]);
     const ports = handler._getPortList();
     const unique = [...new Set(ports)];
     assert.strictEqual(ports.length, unique.length);
@@ -98,7 +98,7 @@ test('CDPHandler._isTargetPage rejects non-pages', () => {
     const handler = new CDPHandler(() => {});
     assert.strictEqual(handler._isTargetPage(null), false);
     assert.strictEqual(handler._isTargetPage({}), false);
-    assert.strictEqual(handler._isTargetPage({ type: 'page' }), false); // no wsUrl
+    assert.strictEqual(handler._isTargetPage({ type: 'page' }), false);
     assert.strictEqual(handler._isTargetPage({ type: 'other', webSocketDebuggerUrl: 'ws://...' }), false);
 });
 
@@ -148,7 +148,6 @@ test('CDPHandler._parseJSON returns fallback for invalid', () => {
 test('CDPHandler backoff increases on failures', async () => {
     const handler = new CDPHandler(() => {});
     assert.strictEqual(handler._failCount, 0);
-    // Simulate calling start with no CDP available
     await handler.start({ ide: 'Code', pollInterval: 800, bannedCommands: [] });
     assert.strictEqual(handler._failCount, 1);
     assert.ok(handler._lastScanTime > 0);
@@ -157,9 +156,6 @@ test('CDPHandler backoff increases on failures', async () => {
 // ─── 2. Auto Accept Pattern Tests ────────────────────────────────────────────
 
 console.log('\n\x1b[1m[Auto Accept Patterns]\x1b[0m');
-
-// Load the auto_accept.js script and extract pattern logic for testing
-// We simulate the regex patterns used in the actual script
 
 const ACCEPT_REGEXES = [
     /\baccept\s+all\b/,
@@ -252,9 +248,332 @@ test('accepts "  Accept  " (whitespace)', () => assert.ok(wouldAccept('  Accept 
 test('accepts "accept" (lowercase)', () => assert.ok(wouldAccept('accept')));
 test('accepts "ACCEPT" (uppercase)', () => assert.ok(wouldAccept('ACCEPT')));
 
-// ─── 3. File Integrity Tests ─────────────────────────────────────────────────
+// ─── 3. Terminal Monitor Tests ───────────────────────────────────────────────
 
-console.log('\n\x1b[1m[File Integrity]\x1b[0m');
+console.log('\n\x1b[1m[Terminal Monitor]\x1b[0m');
+
+const {
+    TerminalMonitorEngine,
+    stripAnsi,
+    PROMPT_PATTERNS,
+    DANGEROUS_TOOLS,
+    extractCommandFromPrompt,
+} = require('../main_scripts/terminal-monitor');
+
+// ── ANSI stripping ──
+
+test('stripAnsi removes CSI sequences', () => {
+    assert.strictEqual(stripAnsi('\x1b[32mGreen\x1b[0m'), 'Green');
+});
+
+test('stripAnsi removes OSC sequences', () => {
+    assert.strictEqual(stripAnsi('\x1b]0;title\x07hello'), 'hello');
+});
+
+test('stripAnsi preserves plain text', () => {
+    assert.strictEqual(stripAnsi('Allow Bash(npm test)? [Y/n]'), 'Allow Bash(npm test)? [Y/n]');
+});
+
+test('stripAnsi handles empty/null input', () => {
+    assert.strictEqual(stripAnsi(''), '');
+    assert.strictEqual(stripAnsi(null), '');
+    assert.strictEqual(stripAnsi(undefined), '');
+});
+
+test('stripAnsi removes carriage returns', () => {
+    assert.strictEqual(stripAnsi('hello\r\nworld'), 'hello\nworld');
+});
+
+test('stripAnsi removes complex ANSI', () => {
+    const input = '\x1b[1;34m\x1b[2K\x1b[1GAllow Bash(ls)? [Y/n]';
+    const cleaned = stripAnsi(input);
+    assert.ok(cleaned.includes('Allow Bash(ls)? [Y/n]'));
+});
+
+// ── Command extraction ──
+
+test('extractCommandFromPrompt: Claude Code Bash', () => {
+    const result = extractCommandFromPrompt('Allow Bash(npm test)? [Y/n]');
+    assert.deepStrictEqual(result, { tool: 'Bash', command: 'npm test' });
+});
+
+test('extractCommandFromPrompt: Claude Code Read', () => {
+    const result = extractCommandFromPrompt('Allow Read(src/file.ts)? [Y/n]');
+    assert.deepStrictEqual(result, { tool: 'Read', command: 'src/file.ts' });
+});
+
+test('extractCommandFromPrompt: Claude Code Write', () => {
+    const result = extractCommandFromPrompt('Allow Write(test/output.json)? [Y/n]');
+    assert.deepStrictEqual(result, { tool: 'Write', command: 'test/output.json' });
+});
+
+test('extractCommandFromPrompt: returns null for non-matching', () => {
+    assert.strictEqual(extractCommandFromPrompt('Do you want to proceed? [Y/n]'), null);
+    assert.strictEqual(extractCommandFromPrompt('Hello world'), null);
+});
+
+test('extractCommandFromPrompt: handles complex commands', () => {
+    const result = extractCommandFromPrompt('Allow Bash(cd /tmp && rm -rf test)? [Y/n]');
+    assert.deepStrictEqual(result, { tool: 'Bash', command: 'cd /tmp && rm -rf test' });
+});
+
+// ── Prompt pattern matching ──
+
+test('PROMPT_PATTERNS matches Claude Code allow prompt', () => {
+    const text = 'Allow Bash(npm test)? [Y/n]';
+    const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+    assert.ok(match);
+    assert.strictEqual(match.name, 'claude-code-allow');
+    assert.strictEqual(match.response, 'Y\n');
+    assert.strictEqual(match.hasTool, true);
+});
+
+test('PROMPT_PATTERNS matches Claude Code proceed prompt', () => {
+    const text = 'Do you want to proceed? [Y/n]';
+    const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+    assert.ok(match);
+    assert.strictEqual(match.name, 'claude-code-proceed');
+});
+
+test('PROMPT_PATTERNS matches generic [Y/n]', () => {
+    const text = 'Continue with installation? [Y/n]';
+    const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+    assert.ok(match);
+    assert.strictEqual(match.response, 'Y\n');
+});
+
+test('PROMPT_PATTERNS matches generic [y/N]', () => {
+    const text = 'Are you sure? [y/N]';
+    const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+    assert.ok(match);
+    assert.strictEqual(match.name, 'generic-yN');
+    assert.strictEqual(match.response, 'y\n');
+});
+
+test('PROMPT_PATTERNS matches (yes/no) prompt', () => {
+    const text = 'Overwrite existing file? (yes/no):';
+    const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+    assert.ok(match);
+    assert.strictEqual(match.name, 'generic-yesno');
+    assert.strictEqual(match.response, 'yes\n');
+});
+
+test('PROMPT_PATTERNS matches (y/n) prompt', () => {
+    const text = 'Proceed? (y/n)';
+    const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+    assert.ok(match);
+    assert.strictEqual(match.name, 'generic-yn-paren');
+    assert.strictEqual(match.response, 'y\n');
+});
+
+test('PROMPT_PATTERNS matches "Press Enter to continue"', () => {
+    const text = 'Press Enter to continue...';
+    const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+    assert.ok(match);
+    assert.strictEqual(match.name, 'press-enter');
+    assert.strictEqual(match.response, '\n');
+});
+
+test('PROMPT_PATTERNS does NOT match random text', () => {
+    const texts = ['npm install complete', 'BUILD SUCCESS', 'Error: file not found', '42'];
+    for (const text of texts) {
+        const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+        assert.strictEqual(match, undefined, `Should not match: "${text}"`);
+    }
+});
+
+test('PROMPT_PATTERNS does NOT match [Y/n] in middle of sentence', () => {
+    // [Y/n] pattern requires end of string
+    const text = 'The [Y/n] option was deprecated last year';
+    // The generic-yn pattern requires [Y/n] at end of line
+    const genericYn = PROMPT_PATTERNS.find(p => p.name === 'generic-yn');
+    assert.ok(!genericYn.pattern.test(text));
+});
+
+test('PROMPT_PATTERNS matches Claude Code with various tools', () => {
+    const tools = ['Bash', 'Read', 'Write', 'Edit', 'Glob', 'Grep', 'WebFetch'];
+    for (const tool of tools) {
+        const text = `Allow ${tool}(test)? [Y/n]`;
+        const match = PROMPT_PATTERNS.find(p => p.pattern.test(text));
+        assert.ok(match, `Should match tool: ${tool}`);
+        assert.strictEqual(match.name, 'claude-code-allow');
+    }
+});
+
+// ── DANGEROUS_TOOLS ──
+
+test('DANGEROUS_TOOLS includes Bash and Execute', () => {
+    assert.ok(DANGEROUS_TOOLS.includes('Bash'));
+    assert.ok(DANGEROUS_TOOLS.includes('Execute'));
+    assert.ok(DANGEROUS_TOOLS.includes('Shell'));
+    assert.ok(DANGEROUS_TOOLS.includes('Run'));
+});
+
+test('DANGEROUS_TOOLS does NOT include Read/Write', () => {
+    assert.ok(!DANGEROUS_TOOLS.includes('Read'));
+    assert.ok(!DANGEROUS_TOOLS.includes('Write'));
+    assert.ok(!DANGEROUS_TOOLS.includes('Edit'));
+});
+
+// ── TerminalMonitorEngine ──
+
+test('TerminalMonitorEngine can be instantiated', () => {
+    const mockVscode = { window: {} };
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    assert.ok(engine);
+    assert.strictEqual(engine.isActive, false);
+});
+
+test('TerminalMonitorEngine.start handles missing proposed API', () => {
+    const mockVscode = { window: {} }; // No onDidWriteTerminalData
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    engine.start({ bannedCommands: [] });
+    assert.strictEqual(engine.isActive, false); // API not available
+});
+
+test('TerminalMonitorEngine.start activates with proposed API', () => {
+    const disposable = { dispose: () => {} };
+    const mockVscode = {
+        window: {
+            onDidWriteTerminalData: (cb) => {
+                return disposable;
+            }
+        }
+    };
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    engine.start({ bannedCommands: [] });
+    assert.strictEqual(engine.isActive, true);
+    engine.stop();
+    assert.strictEqual(engine.isActive, false);
+});
+
+test('TerminalMonitorEngine.getStats returns initial state', () => {
+    const mockVscode = { window: {} };
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    const stats = engine.getStats();
+    assert.strictEqual(stats.clicks, 0);
+    assert.strictEqual(stats.blocked, 0);
+    assert.strictEqual(stats.lastAction, null);
+});
+
+test('TerminalMonitorEngine._isBannedCommand detects banned substrings', () => {
+    const mockVscode = { window: {} };
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    engine.start({ bannedCommands: ['rm -rf /', 'format c:'] });
+    assert.strictEqual(engine._isBannedCommand('rm -rf / --no-preserve-root'), true);
+    assert.strictEqual(engine._isBannedCommand('format c: /q'), true);
+    assert.strictEqual(engine._isBannedCommand('npm test'), false);
+    engine.stop();
+});
+
+test('TerminalMonitorEngine._isBannedCommand supports regex', () => {
+    const mockVscode = { window: {} };
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    engine.start({ bannedCommands: ['/^sudo\\s+rm/i'] });
+    assert.strictEqual(engine._isBannedCommand('sudo rm -rf /'), true);
+    assert.strictEqual(engine._isBannedCommand('rm file.txt'), false);
+    engine.stop();
+});
+
+test('TerminalMonitorEngine._isBannedCommand returns false for empty list', () => {
+    const mockVscode = { window: {} };
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    engine.start({ bannedCommands: [] });
+    assert.strictEqual(engine._isBannedCommand('rm -rf /'), false);
+    engine.stop();
+});
+
+test('TerminalMonitorEngine custom patterns are added', () => {
+    const mockVscode = { window: {} };
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    engine.start({ bannedCommands: [], terminalPatterns: ['Custom prompt\\?'] });
+    // Check that custom patterns were parsed (internal state)
+    assert.strictEqual(engine._customPatterns.length, 1);
+    assert.ok(engine._customPatterns[0].pattern.test('Custom prompt?'));
+    engine.stop();
+});
+
+test('TerminalMonitorEngine ignores invalid custom patterns', () => {
+    const mockVscode = { window: {} };
+    const engine = new TerminalMonitorEngine(() => {}, mockVscode);
+    engine.start({ bannedCommands: [], terminalPatterns: ['[invalid regex'] });
+    assert.strictEqual(engine._customPatterns.length, 0);
+    engine.stop();
+});
+
+// ─── 4. Engine Manager Tests ─────────────────────────────────────────────────
+
+console.log('\n\x1b[1m[Engine Manager]\x1b[0m');
+
+const { EngineManager } = require('../main_scripts/engine-manager');
+
+test('EngineManager can be instantiated', () => {
+    const mockVscode = { window: {} };
+    const manager = new EngineManager(() => {}, mockVscode);
+    assert.ok(manager);
+    assert.strictEqual(manager.isConnected, false);
+    assert.strictEqual(manager.primaryEngine, 'none');
+});
+
+test('EngineManager.start initializes terminal engine', () => {
+    const disposable = { dispose: () => {} };
+    const mockVscode = {
+        window: {
+            onDidWriteTerminalData: () => disposable
+        }
+    };
+    const manager = new EngineManager(() => {}, mockVscode);
+    manager.start({ bannedCommands: [], engineMode: 'auto' });
+    assert.strictEqual(manager.isConnected, true);
+    assert.strictEqual(manager.primaryEngine, 'terminal');
+    manager.stop();
+});
+
+test('EngineManager respects terminal-only mode', () => {
+    const mockVscode = { window: {} };
+    const manager = new EngineManager(() => {}, mockVscode);
+    manager.start({ bannedCommands: [], engineMode: 'terminal-only' });
+    // Terminal engine won't be active (no proposed API in mock), but mode is respected
+    assert.strictEqual(manager._mode, 'terminal-only');
+    manager.stop();
+});
+
+test('EngineManager respects cdp-only mode', () => {
+    const disposable = { dispose: () => {} };
+    const mockVscode = {
+        window: {
+            onDidWriteTerminalData: () => disposable
+        }
+    };
+    const manager = new EngineManager(() => {}, mockVscode);
+    manager.start({ bannedCommands: [], engineMode: 'cdp-only' });
+    // Terminal engine should NOT be active in cdp-only mode
+    assert.strictEqual(manager.terminal.isActive, false);
+    assert.strictEqual(manager._mode, 'cdp-only');
+    manager.stop();
+});
+
+test('EngineManager.getStats aggregates both engines', async () => {
+    const mockVscode = { window: {} };
+    const manager = new EngineManager(() => {}, mockVscode);
+    const stats = await manager.getStats();
+    assert.strictEqual(stats.clicks, 0);
+    assert.strictEqual(stats.blocked, 0);
+    assert.strictEqual(stats.terminalClicks, 0);
+    assert.strictEqual(stats.cdpClicks, 0);
+    assert.strictEqual(stats.engine, 'none');
+});
+
+test('EngineManager.setCustomPorts forwards to CDP', () => {
+    const mockVscode = { window: {} };
+    const manager = new EngineManager(() => {}, mockVscode);
+    manager.setCustomPorts([9222]);
+    assert.deepStrictEqual(manager.cdp._customPorts, [9222]);
+});
+
+// ─── 5. File Integrity Tests (v1.2) ─────────────────────────────────────────
+
+console.log('\n\x1b[1m[File Integrity v1.2]\x1b[0m');
 
 test('auto_accept.js exists', () => {
     const p = path.join(__dirname, '..', 'main_scripts', 'auto_accept.js');
@@ -266,27 +585,89 @@ test('cdp-handler.js exists', () => {
     assert.ok(fs.existsSync(p));
 });
 
+test('terminal-monitor.js exists', () => {
+    const p = path.join(__dirname, '..', 'main_scripts', 'terminal-monitor.js');
+    assert.ok(fs.existsSync(p));
+});
+
+test('engine-manager.js exists', () => {
+    const p = path.join(__dirname, '..', 'main_scripts', 'engine-manager.js');
+    assert.ok(fs.existsSync(p));
+});
+
 test('extension.js exists', () => {
     const p = path.join(__dirname, '..', 'extension.js');
     assert.ok(fs.existsSync(p));
 });
 
-test('dist/extension.js exists (compiled)', () => {
-    const p = path.join(__dirname, '..', 'dist', 'extension.js');
-    assert.ok(fs.existsSync(p));
-});
-
-test('package.json version is 1.1.0', () => {
+test('package.json version is 1.2.0', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
-    assert.strictEqual(pkg.version, '1.1.0');
+    assert.strictEqual(pkg.version, '1.2.0');
 });
 
-test('package.json has debugPort setting', () => {
+test('package.json has enabledApiProposals', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    assert.ok(Array.isArray(pkg.enabledApiProposals));
+    assert.ok(pkg.enabledApiProposals.includes('terminalDataWriteEvent'));
+});
+
+test('package.json has quickAccept command', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    const cmds = pkg.contributes.commands;
+    const quick = cmds.find(c => c.command === 'shadow-accept.quickAccept');
+    assert.ok(quick);
+});
+
+test('package.json has keybindings', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    const kb = pkg.contributes.keybindings;
+    assert.ok(Array.isArray(kb));
+    assert.ok(kb.length > 0);
+    assert.strictEqual(kb[0].command, 'shadow-accept.quickAccept');
+    assert.strictEqual(kb[0].key, 'ctrl+shift+y');
+});
+
+test('package.json has engineMode setting', () => {
     const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
     const props = pkg.contributes.configuration.properties;
-    assert.ok(props['shadowAccept.debugPort']);
-    assert.strictEqual(props['shadowAccept.debugPort'].type, 'number');
-    assert.strictEqual(props['shadowAccept.debugPort'].default, 0);
+    assert.ok(props['shadowAccept.engineMode']);
+    assert.strictEqual(props['shadowAccept.engineMode'].default, 'auto');
+});
+
+test('package.json has terminalPatterns setting', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    const props = pkg.contributes.configuration.properties;
+    assert.ok(props['shadowAccept.terminalPatterns']);
+    assert.strictEqual(props['shadowAccept.terminalPatterns'].type, 'array');
+});
+
+test('package.json engine version >= 1.83.0', () => {
+    const pkg = JSON.parse(fs.readFileSync(path.join(__dirname, '..', 'package.json'), 'utf8'));
+    assert.strictEqual(pkg.engines.vscode, '^1.83.0');
+});
+
+test('extension.js imports EngineManager', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+    assert.ok(src.includes('EngineManager'));
+    assert.ok(src.includes('engine-manager'));
+});
+
+test('extension.js has quickAccept command', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+    assert.ok(src.includes('quickAccept'));
+    assert.ok(src.includes('shadow-accept.quickAccept'));
+});
+
+test('extension.js has engine cards in webview', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+    assert.ok(src.includes('engine-card'));
+    assert.ok(src.includes('Terminal Monitor'));
+    assert.ok(src.includes('CDP Engine'));
+});
+
+test('extension.js version is 1.2', () => {
+    const src = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
+    assert.ok(src.includes('v1.2'));
 });
 
 test('auto_accept.js contains word-boundary patterns', () => {
@@ -301,22 +682,10 @@ test('cdp-handler.js includes port 9222', () => {
     assert.ok(src.includes('9222'), 'Missing port 9222');
 });
 
-test('cdp-handler.js includes port 9229', () => {
-    const src = fs.readFileSync(path.join(__dirname, '..', 'main_scripts', 'cdp-handler.js'), 'utf8');
-    assert.ok(src.includes('9229'), 'Missing port 9229');
-});
-
 test('cdp-handler.js has backoff logic', () => {
     const src = fs.readFileSync(path.join(__dirname, '..', 'main_scripts', 'cdp-handler.js'), 'utf8');
     assert.ok(src.includes('BACKOFF_BASE_MS'), 'Missing backoff constants');
     assert.ok(src.includes('_failCount'), 'Missing fail count tracking');
-});
-
-test('extension.js has connection status', () => {
-    const src = fs.readFileSync(path.join(__dirname, '..', 'extension.js'), 'utf8');
-    assert.ok(src.includes('isConnected'), 'Missing connection status');
-    assert.ok(src.includes('connectedPort'), 'Missing connected port');
-    assert.ok(src.includes('conn-badge'), 'Missing connection badge UI');
 });
 
 test('auto_accept.js has Shadow DOM traversal', () => {
@@ -324,12 +693,19 @@ test('auto_accept.js has Shadow DOM traversal', () => {
     assert.ok(src.includes('shadowRoot'), 'Missing Shadow DOM traversal');
 });
 
-// ─── 4. CDP Connection Tests (with mock server) ─────────────────────────────
+test('terminal-monitor.js exports all required symbols', () => {
+    assert.ok(typeof TerminalMonitorEngine === 'function');
+    assert.ok(typeof stripAnsi === 'function');
+    assert.ok(Array.isArray(PROMPT_PATTERNS));
+    assert.ok(Array.isArray(DANGEROUS_TOOLS));
+    assert.ok(typeof extractCommandFromPrompt === 'function');
+});
+
+// ─── 6. CDP Connection Tests (with mock server) ─────────────────────────────
 
 console.log('\n\x1b[1m[CDP Mock Server]\x1b[0m');
 
 async function runMockCDPTests() {
-    // Create a mock CDP server
     const mockPages = [{
         id: 'test-page-1',
         type: 'page',
@@ -365,7 +741,6 @@ async function runMockCDPTests() {
         });
 
         await testAsync('_listPages filters DevTools pages', async () => {
-            // Temporarily change mock to return a devtools page
             const origPages = [...mockPages];
             mockPages.push({
                 id: 'devtools-1',
@@ -376,10 +751,9 @@ async function runMockCDPTests() {
 
             const handler = new CDPHandler(() => {});
             const pages = await handler._listPages(19222);
-            assert.strictEqual(pages.length, 1); // Only the real page, not devtools
+            assert.strictEqual(pages.length, 1);
             assert.strictEqual(pages[0].id, 'test-page-1');
 
-            // Restore
             mockPages.length = 0;
             mockPages.push(...origPages);
         });
@@ -387,13 +761,9 @@ async function runMockCDPTests() {
         await testAsync('caches port after successful discovery', async () => {
             const handler = new CDPHandler(() => {});
             handler.setCustomPorts([19222]);
-            // We can't fully connect (no WS), but we can verify port caching logic
-            // by checking the cached port after _listPages succeeds
             const pages = await handler._listPages(19222);
             assert.ok(pages.length > 0);
-            // The start() method would set _cachedPort, but WS connection will fail
-            // Still, verify the mechanism exists
-            assert.strictEqual(handler._cachedPort, null); // Not set yet (only set by start())
+            assert.strictEqual(handler._cachedPort, null);
         });
 
     } finally {

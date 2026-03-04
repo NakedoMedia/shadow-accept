@@ -1,22 +1,22 @@
 /**
- * Shadow Accept — VS Code Extension v1.1
+ * Shadow Accept — VS Code Extension v1.2
  * by Nakedo Corp — MIT License
  *
  * Premium open-source auto-accept for AI agent prompts.
  * VS Code · Antigravity · Cursor
  * 100% free · no limits · no telemetry · no external API
  *
- * v1.1 fixes:
- *  - Connection status indicator in status bar
- *  - Separated discovery polling (slow) from stats refresh (fast)
- *  - User notification when CDP is not available with setup instructions
- *  - Custom debug port configuration
+ * v1.2: Zero-config multi-engine architecture.
+ *  - Terminal Monitor Engine (primary, zero-config via proposed API)
+ *  - CDP Engine (secondary, requires --remote-debugging-port)
+ *  - Quick Accept shortcut (Ctrl+Shift+Y)
+ *  - Engine mode selector (auto / terminal-only / cdp-only)
  */
 
 'use strict';
 
 const vscode = require('vscode');
-const { CDPHandler } = require('./main_scripts/cdp-handler');
+const { EngineManager } = require('./main_scripts/engine-manager');
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -34,11 +34,11 @@ let discoveryTimer    = null;
 let statsTimer        = null;
 let statusBarItem     = null;
 let outputChannel     = null;
-let cdpHandler        = null;
+let engineManager     = null;
 let globalContext     = null;
 let currentIDE        = 'Code';
 let sessionClicks     = 0;
-let hasShownCDPHelp   = false;  // Only show CDP help once per session
+let hasShownCDPHelp   = false;
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -60,10 +60,12 @@ function detectIDE() {
 function getConfig() {
     const cfg = vscode.workspace.getConfiguration('shadowAccept');
     return {
-        pollInterval:    cfg.get('pollInterval',    800),
-        bannedCommands:  cfg.get('bannedCommands',  getDefaultBannedCommands()),
-        enableOnStartup: cfg.get('enableOnStartup', false),
-        debugPort:       cfg.get('debugPort',       0),
+        pollInterval:     cfg.get('pollInterval',     800),
+        bannedCommands:   cfg.get('bannedCommands',   getDefaultBannedCommands()),
+        enableOnStartup:  cfg.get('enableOnStartup',  false),
+        debugPort:        cfg.get('debugPort',        0),
+        engineMode:       cfg.get('engineMode',       'auto'),
+        terminalPatterns: cfg.get('terminalPatterns', []),
     };
 }
 
@@ -83,16 +85,20 @@ function updateStatusBar() {
     const clickLabel  = totalClicks > 0 ? ` (${formatCount(totalClicks)})` : '';
 
     if (isEnabled) {
-        const connected = cdpHandler?.isConnected;
+        const connected = engineManager?.isConnected;
         if (connected) {
-            const port = cdpHandler.connectedPort ? `:${cdpHandler.connectedPort}` : '';
+            const engine = engineManager.primaryEngine;
+            const engineLabel = engine === 'terminal+cdp' ? 'Terminal+CDP'
+                : engine === 'terminal' ? 'Terminal'
+                : engine === 'cdp' ? `CDP:${engineManager.connectedPort || '?'}`
+                : '';
             statusBarItem.text            = `$(check) Shadow${clickLabel}`;
-            statusBarItem.tooltip         = `Shadow Accept is ON — Connected${port}\n${totalClicks} auto-accepted total\nClick to disable`;
+            statusBarItem.tooltip         = `Shadow Accept is ON — ${engineLabel}\n${totalClicks} auto-accepted total\nClick to disable`;
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.warningBackground');
             statusBarItem.color           = undefined;
         } else {
             statusBarItem.text            = `$(sync~spin) Shadow`;
-            statusBarItem.tooltip         = `Shadow Accept is ON — Searching for CDP...\nEnsure IDE was launched with --remote-debugging-port=9222\nClick to disable`;
+            statusBarItem.tooltip         = `Shadow Accept is ON — Searching for engines...\nClick to disable`;
             statusBarItem.backgroundColor = new vscode.ThemeColor('statusBarItem.errorBackground');
             statusBarItem.color           = undefined;
         }
@@ -112,22 +118,30 @@ function formatCount(n) {
 // ─── CDP Help Notification ────────────────────────────────────────────────────
 
 function showCDPHelpIfNeeded() {
-    if (hasShownCDPHelp || !isEnabled || !cdpHandler) return;
-    if (cdpHandler.isConnected) return; // Connected, no help needed
+    if (hasShownCDPHelp || !isEnabled || !engineManager) return;
+
+    // If terminal engine is active, no need to show CDP help
+    if (engineManager.terminal.isActive) return;
+    if (engineManager.cdp.isConnected) return;
 
     // Show help after 8 seconds of no connection
     setTimeout(() => {
-        if (hasShownCDPHelp || !isEnabled || cdpHandler?.isConnected) return;
+        if (hasShownCDPHelp || !isEnabled) return;
+        // Recheck: terminal engine may have connected by now
+        if (engineManager?.terminal.isActive || engineManager?.cdp.isConnected) return;
         hasShownCDPHelp = true;
 
         const ide = currentIDE;
+        const cfg = getConfig();
         let helpMsg;
-        if (ide === 'Cursor') {
-            helpMsg = 'Shadow Accept needs Cursor\'s debug port. Try launching Cursor with: cursor --remote-debugging-port=9222';
+        if (cfg.engineMode === 'terminal-only') {
+            helpMsg = 'Shadow Accept terminal monitor needs the proposed onDidWriteTerminalData API. This works best with sideloaded extensions.';
+        } else if (ide === 'Cursor') {
+            helpMsg = 'Shadow Accept: Terminal monitor unavailable. For CDP fallback, launch Cursor with: cursor --remote-debugging-port=9222';
         } else if (ide === 'Antigravity') {
-            helpMsg = 'Shadow Accept needs Antigravity\'s debug port. Try launching with: antigravity --remote-debugging-port=9222';
+            helpMsg = 'Shadow Accept: Terminal monitor unavailable. For CDP fallback, launch with: antigravity --remote-debugging-port=9222';
         } else {
-            helpMsg = 'Shadow Accept needs VS Code\'s debug port. Launch VS Code with: code --remote-debugging-port=9222';
+            helpMsg = 'Shadow Accept: Terminal monitor unavailable. For CDP fallback, launch VS Code with: code --remote-debugging-port=9222';
         }
 
         vscode.window.showWarningMessage(
@@ -149,19 +163,31 @@ function showCDPHelpIfNeeded() {
     }, 8000);
 }
 
+// ─── Quick Accept command ─────────────────────────────────────────────────────
+
+function cmdQuickAccept() {
+    const terminal = vscode.window.activeTerminal;
+    if (terminal) {
+        terminal.sendText('Y', false);
+        terminal.sendText('\n', false);
+        log('[QuickAccept] Sent Y to active terminal');
+    } else {
+        vscode.window.showWarningMessage('No active terminal found.');
+    }
+}
+
 // ─── Polling (separated discovery & stats) ────────────────────────────────────
 
 async function runDiscoveryCycle() {
-    if (!isEnabled || !cdpHandler) return;
+    if (!isEnabled || !engineManager) return;
     const cfg = getConfig();
 
-    // Pass custom port to handler
     if (cfg.debugPort > 0) {
-        cdpHandler.setCustomPorts([cfg.debugPort]);
+        engineManager.setCustomPorts([cfg.debugPort]);
     }
 
     try {
-        await cdpHandler.start({
+        await engineManager.startCDP({
             ide:            currentIDE,
             pollInterval:   cfg.pollInterval,
             bannedCommands: cfg.bannedCommands,
@@ -174,9 +200,9 @@ async function runDiscoveryCycle() {
 }
 
 async function runStatsCycle() {
-    if (!isEnabled || !cdpHandler || !cdpHandler.isConnected) return;
+    if (!isEnabled || !engineManager || !engineManager.isConnected) return;
     try {
-        const stats = await cdpHandler.getStats();
+        const stats = await engineManager.getStats();
         if (stats.clicks !== sessionClicks) {
             sessionClicks = stats.clicks;
             updateStatusBar();
@@ -188,23 +214,29 @@ async function runStatsCycle() {
 
 function startPolling() {
     stopPolling();
-    log(`Starting — discovery every ${DISCOVERY_INTERVAL_MS}ms, stats every ${STATS_INTERVAL_MS}ms on ${currentIDE}`);
+    const cfg = getConfig();
+    log(`Starting v1.2 — mode=${cfg.engineMode}, discovery every ${DISCOVERY_INTERVAL_MS}ms, stats every ${STATS_INTERVAL_MS}ms on ${currentIDE}`);
 
-    // Run discovery immediately, then on slow interval
+    // Start terminal engine immediately (sync, zero-config)
+    engineManager.start(cfg);
+
+    // Run CDP discovery immediately, then on slow interval
     runDiscoveryCycle();
     discoveryTimer = setInterval(runDiscoveryCycle, DISCOVERY_INTERVAL_MS);
 
     // Stats on faster interval
     statsTimer = setInterval(runStatsCycle, STATS_INTERVAL_MS);
 
-    // Show CDP help if needed
+    // Show CDP help if needed (only when terminal engine unavailable)
     showCDPHelpIfNeeded();
+
+    updateStatusBar();
 }
 
 function stopPolling() {
     if (discoveryTimer) { clearInterval(discoveryTimer); discoveryTimer = null; }
     if (statsTimer)     { clearInterval(statsTimer);     statsTimer = null; }
-    cdpHandler?.stop().catch(() => {});
+    engineManager?.stop().catch(() => {});
 }
 
 // ─── Toggle command ───────────────────────────────────────────────────────────
@@ -216,7 +248,7 @@ async function cmdToggle(context) {
 
     if (isEnabled) {
         log('Enabled');
-        hasShownCDPHelp = false; // Reset help flag on re-enable
+        hasShownCDPHelp = false;
         startPolling();
         vscode.window.showInformationMessage(
             `$(check) Shadow Accept is ON`,
@@ -226,7 +258,6 @@ async function cmdToggle(context) {
             if (choice === 'Disable')  cmdToggle(context);
         });
     } else {
-        // Persist session clicks before disabling
         const prev  = context.globalState.get(STATE_TOTAL_CLICKS) ?? 0;
         await context.globalState.update(STATE_TOTAL_CLICKS, prev + sessionClicks);
         sessionClicks = 0;
@@ -249,36 +280,42 @@ function cmdOpenSettings(context) {
 
     panel.iconPath = vscode.Uri.joinPath(context.extensionUri, 'media', 'icon.png');
 
-    const cfg        = getConfig();
-    const bannedStr  = cfg.bannedCommands.join('\n');
+    const cfg         = getConfig();
+    const bannedStr   = cfg.bannedCommands.join('\n');
     const totalClicks = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + sessionClicks;
-    const connected   = cdpHandler?.isConnected ?? false;
-    const port        = cdpHandler?.connectedPort ?? null;
+    const engine      = engineManager?.primaryEngine ?? 'none';
+    const termActive  = engineManager?.terminal.isActive ?? false;
+    const cdpConn     = engineManager?.cdp.isConnected ?? false;
+    const port        = engineManager?.connectedPort ?? null;
 
-    panel.webview.html = buildSettingsHTML(cfg, bannedStr, totalClicks, currentIDE, isEnabled, connected, port);
+    panel.webview.html = buildSettingsHTML(cfg, bannedStr, totalClicks, currentIDE, isEnabled, engine, termActive, cdpConn, port);
 
     panel.webview.onDidReceiveMessage(async msg => {
         switch (msg.type) {
 
             case 'getStats': {
-                const stats = cdpHandler ? await cdpHandler.getStats() : { clicks: 0, blocked: 0, uptime: 0 };
+                const stats = engineManager ? await engineManager.getStats() : { clicks: 0, blocked: 0, terminalClicks: 0, cdpClicks: 0, engine: 'none' };
                 const total = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + stats.clicks;
                 panel.webview.postMessage({
                     type: 'stats', ...stats, total, enabled: isEnabled, ide: currentIDE,
-                    connected: cdpHandler?.isConnected ?? false,
-                    port: cdpHandler?.connectedPort ?? null,
+                    connected: engineManager?.isConnected ?? false,
+                    port: engineManager?.connectedPort ?? null,
+                    terminalActive: stats.terminalActive ?? false,
+                    cdpConnected: stats.cdpConnected ?? false,
                 });
                 break;
             }
 
             case 'toggle': {
                 await cmdToggle(context);
-                const stats2 = cdpHandler ? await cdpHandler.getStats() : { clicks: 0, blocked: 0 };
+                const stats2 = engineManager ? await engineManager.getStats() : { clicks: 0, blocked: 0, terminalClicks: 0, cdpClicks: 0, engine: 'none' };
                 const total2 = (context.globalState.get(STATE_TOTAL_CLICKS) ?? 0) + stats2.clicks;
                 panel.webview.postMessage({
                     type: 'stats', ...stats2, total: total2, enabled: isEnabled, ide: currentIDE,
-                    connected: cdpHandler?.isConnected ?? false,
-                    port: cdpHandler?.connectedPort ?? null,
+                    connected: engineManager?.isConnected ?? false,
+                    port: engineManager?.connectedPort ?? null,
+                    terminalActive: stats2.terminalActive ?? false,
+                    cdpConnected: stats2.cdpConnected ?? false,
                 });
                 break;
             }
@@ -290,9 +327,12 @@ function cmdOpenSettings(context) {
                 if (msg.debugPort !== undefined) {
                     await wcfg.update('debugPort', msg.debugPort, vscode.ConfigurationTarget.Global);
                 }
-                if (isEnabled) startPolling(); // restart with new config
+                if (msg.engineMode !== undefined) {
+                    await wcfg.update('engineMode', msg.engineMode, vscode.ConfigurationTarget.Global);
+                }
+                if (isEnabled) startPolling();
                 panel.webview.postMessage({ type: 'saved' });
-                log(`Settings saved — pollInterval=${msg.pollInterval}ms, banned=${msg.bannedCommands.length}`);
+                log(`Settings saved — pollInterval=${msg.pollInterval}ms, mode=${msg.engineMode}, banned=${msg.bannedCommands.length}`);
                 break;
             }
 
@@ -306,9 +346,15 @@ function cmdOpenSettings(context) {
 
 // ─── Settings HTML ────────────────────────────────────────────────────────────
 
-function buildSettingsHTML(cfg, bannedStr, totalClicks, ide, enabled, connected, port) {
-    const connLabel = connected ? `Connected on port ${port}` : 'Not connected — see log';
-    const connClass = connected ? 'conn-ok' : 'conn-err';
+function buildSettingsHTML(cfg, bannedStr, totalClicks, ide, enabled, engine, termActive, cdpConn, port) {
+    const engineLabels = {
+        'terminal+cdp': 'Terminal + CDP',
+        'terminal':     'Terminal Monitor',
+        'cdp':          `CDP on port ${port || '?'}`,
+        'none':         'No engine connected',
+    };
+    const connLabel = engineLabels[engine] || 'No engine connected';
+    const connClass = engine !== 'none' ? 'conn-ok' : 'conn-err';
     return /* html */`<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -366,6 +412,17 @@ body {
 .conn-err .conn-dot { background: var(--orange); animation: pulse 1.5s infinite; }
 @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.3} }
 
+/* ── Engine cards ── */
+.engine-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-bottom: 20px; }
+.engine-card {
+    padding: 10px 14px; border-radius: 8px; font-size: 12px;
+    background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
+}
+.engine-card.active { border-color: var(--green); background: rgba(34,197,94,.04); }
+.engine-card .engine-name { font-weight: 600; font-size: 13px; margin-bottom: 2px; }
+.engine-card .engine-status { opacity: 0.5; font-size: 11px; }
+.engine-card.active .engine-status { color: var(--green); opacity: 1; }
+
 /* ── Toggle button ── */
 .toggle-btn {
     display: flex; align-items: center; gap: 10px;
@@ -383,7 +440,7 @@ body {
 .toggle-ide { font-size: 11px; opacity: 0.5; font-weight: 400; }
 
 /* ── Stats row ── */
-.stats { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin-bottom: 28px; }
+.stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 28px; }
 .stat-card {
     padding: 14px 16px; border-radius: 8px;
     background: rgba(255,255,255,.03); border: 1px solid rgba(255,255,255,.06);
@@ -393,6 +450,7 @@ body {
 .stat-card.green .stat-val { color: var(--green); }
 .stat-card.red   .stat-val { color: var(--red); }
 .stat-card.acc   .stat-val { color: var(--accent); }
+.stat-card.blue  .stat-val { color: #60a5fa; }
 
 /* ── Sections ── */
 .section { margin-bottom: 24px; }
@@ -410,6 +468,13 @@ input[type=number] {
     padding: 6px 10px; font-size: 13px; font-family: var(--mono);
 }
 input[type=number]:focus { outline: none; border-color: var(--accent); }
+
+select {
+    background: var(--input-bg); color: var(--fg);
+    border: 1px solid var(--input-bd); border-radius: 6px;
+    padding: 6px 10px; font-size: 13px; font-family: var(--font);
+}
+select:focus { outline: none; border-color: var(--accent); }
 
 textarea {
     width: 100%; min-height: 130px; resize: vertical;
@@ -455,6 +520,17 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     font-family: var(--mono); font-size: 11px;
 }
 
+/* ── Shortcut hint ── */
+.shortcut-box {
+    padding: 10px 14px; border-radius: 8px; font-size: 12px;
+    background: rgba(124,106,247,.04); border: 1px solid rgba(124,106,247,.1);
+    margin-bottom: 24px; display: flex; align-items: center; gap: 8px;
+}
+.shortcut-box kbd {
+    background: rgba(255,255,255,.1); padding: 2px 8px; border-radius: 4px;
+    font-family: var(--mono); font-size: 11px; border: 1px solid rgba(255,255,255,.15);
+}
+
 /* ── Footer ── */
 .footer { margin-top: 32px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,.06); display: flex; justify-content: space-between; align-items: center; }
 .footer-logo { font-size: 11px; opacity: .35; font-weight: 600; letter-spacing: .3px; }
@@ -479,12 +555,29 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     <span id="connLabel">${connLabel}</span>
 </div>
 
+<!-- Engine cards -->
+<div class="engine-row">
+    <div class="engine-card ${termActive ? 'active' : ''}" id="termCard">
+        <div class="engine-name">Terminal Monitor</div>
+        <div class="engine-status" id="termStatus">${termActive ? 'Active — zero config' : 'Inactive'}</div>
+    </div>
+    <div class="engine-card ${cdpConn ? 'active' : ''}" id="cdpCard">
+        <div class="engine-name">CDP Engine</div>
+        <div class="engine-status" id="cdpStatus">${cdpConn ? 'Connected on port ' + port : 'Not connected'}</div>
+    </div>
+</div>
+
 <!-- Toggle -->
 <button class="toggle-btn ${enabled ? 'on' : 'off'}" id="toggleBtn" onclick="toggleAccept()">
     <span class="dot" id="dot"></span>
     <span class="toggle-label" id="toggleLabel">${enabled ? 'Auto Accept is ON' : 'Auto Accept is OFF'}</span>
     <span class="toggle-ide" id="toggleIde">${ide}</span>
 </button>
+
+<!-- Quick Accept hint -->
+<div class="shortcut-box">
+    <kbd>Ctrl+Shift+Y</kbd> Quick Accept — sends Y to active terminal instantly
+</div>
 
 <!-- Stats -->
 <div class="stats">
@@ -496,17 +589,33 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
         <div class="stat-val" id="statTotal">${totalClicks}</div>
         <div class="stat-lbl">All-time accepts</div>
     </div>
+    <div class="stat-card blue">
+        <div class="stat-val" id="statTerminal">0</div>
+        <div class="stat-lbl">Terminal accepts</div>
+    </div>
     <div class="stat-card red">
         <div class="stat-val" id="statBlocked">0</div>
         <div class="stat-lbl">Blocked commands</div>
     </div>
 </div>
 
-<!-- Help box (shown when not connected) -->
-<div class="help-box" id="helpBox" style="${connected ? 'display:none' : ''}">
-    <strong>Not connected?</strong> Launch your IDE with the debug flag:<br>
-    <code>${ide === 'Cursor' ? 'cursor' : ide === 'Antigravity' ? 'antigravity' : 'code'} --remote-debugging-port=9222</code><br>
-    Or set a custom port below if your IDE uses a different one.
+<!-- Help box (shown when no engine connected) -->
+<div class="help-box" id="helpBox" style="${engine !== 'none' ? 'display:none' : ''}">
+    <strong>No engine connected?</strong><br>
+    The <strong>Terminal Monitor</strong> works automatically with sideloaded VSIX extensions.<br>
+    For CDP fallback, launch your IDE with: <code>${ide === 'Cursor' ? 'cursor' : ide === 'Antigravity' ? 'antigravity' : 'code'} --remote-debugging-port=9222</code>
+</div>
+
+<!-- Engine mode -->
+<div class="section">
+    <div class="section-title">Engine</div>
+    <label for="engineMode">Engine mode</label>
+    <select id="engineMode">
+        <option value="auto" ${cfg.engineMode === 'auto' ? 'selected' : ''}>Auto (terminal + CDP)</option>
+        <option value="terminal-only" ${cfg.engineMode === 'terminal-only' ? 'selected' : ''}>Terminal only</option>
+        <option value="cdp-only" ${cfg.engineMode === 'cdp-only' ? 'selected' : ''}>CDP only (v1.1 behavior)</option>
+    </select>
+    <p class="hint">Auto: terminal monitor first (zero-config), CDP as fallback. Terminal-only skips CDP. CDP-only requires debug port.</p>
 </div>
 
 <!-- Debug port -->
@@ -514,7 +623,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     <div class="section-title">Connection</div>
     <label for="debugPort">Custom debug port (0 = auto-scan)</label>
     <input type="number" id="debugPort" min="0" max="65535" value="${cfg.debugPort || 0}">
-    <p class="hint">If your IDE uses a specific debug port, set it here for faster connection. Leave 0 for automatic scanning.</p>
+    <p class="hint">If your IDE uses a specific debug port, set it here for faster CDP connection. Leave 0 for automatic scanning.</p>
 </div>
 
 <!-- Poll interval -->
@@ -525,7 +634,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
         <input type="range" id="pollRange" min="300" max="3000" step="100" value="${cfg.pollInterval}" oninput="updatePollLabel()">
         <span class="range-val" id="pollLabel">${cfg.pollInterval} ms</span>
     </div>
-    <p class="hint">How often Shadow Accept scans for buttons. 300ms = fastest · 3000ms = most conservative. Default: 800ms.</p>
+    <p class="hint">How often Shadow Accept scans for buttons (CDP engine). Terminal engine responds instantly. Default: 800ms.</p>
 </div>
 
 <!-- Banned commands -->
@@ -533,7 +642,7 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     <div class="section-title">Safety</div>
     <label for="bannedArea">Banned command patterns</label>
     <textarea id="bannedArea" placeholder="One pattern per line.\nSupports /regex/flags syntax.">${bannedStr}</textarea>
-    <p class="hint">Run/execute buttons are <strong>never</strong> clicked if the nearby terminal command matches one of these patterns.</p>
+    <p class="hint">Run/execute buttons and terminal commands matching these patterns will <strong>never</strong> be auto-accepted.</p>
 </div>
 
 <!-- Actions -->
@@ -564,9 +673,10 @@ let refreshInterval;
 window.addEventListener('message', e => {
     const m = e.data;
     if (m.type === 'stats') {
-        document.getElementById('statClicks').textContent  = m.clicks  ?? 0;
-        document.getElementById('statBlocked').textContent = m.blocked ?? 0;
-        document.getElementById('statTotal').textContent   = m.total   ?? 0;
+        document.getElementById('statClicks').textContent   = m.clicks   ?? 0;
+        document.getElementById('statBlocked').textContent  = m.blocked  ?? 0;
+        document.getElementById('statTotal').textContent    = m.total    ?? 0;
+        document.getElementById('statTerminal').textContent = m.terminalClicks ?? 0;
         const on = !!m.enabled;
         const btn = document.getElementById('toggleBtn');
         btn.className = 'toggle-btn ' + (on ? 'on' : 'off');
@@ -577,18 +687,44 @@ window.addEventListener('message', e => {
         const badge = document.getElementById('connBadge');
         const label = document.getElementById('connLabel');
         const helpBox = document.getElementById('helpBox');
-        if (m.connected) {
+        const engine = m.engine || 'none';
+        if (engine !== 'none') {
             badge.className = 'conn-badge conn-ok';
-            label.textContent = 'Connected on port ' + (m.port || '?');
+            const labels = {
+                'terminal+cdp': 'Terminal + CDP',
+                'terminal': 'Terminal Monitor',
+                'cdp': 'CDP on port ' + (m.port || '?'),
+            };
+            label.textContent = labels[engine] || engine;
             helpBox.style.display = 'none';
         } else if (on) {
             badge.className = 'conn-badge conn-err';
-            label.textContent = 'Searching for CDP...';
+            label.textContent = 'Searching for engines...';
             helpBox.style.display = '';
         } else {
             badge.className = 'conn-badge conn-err';
             label.textContent = 'Disabled';
             helpBox.style.display = 'none';
+        }
+
+        // Update engine cards
+        const termCard = document.getElementById('termCard');
+        const cdpCard = document.getElementById('cdpCard');
+        const termStatus = document.getElementById('termStatus');
+        const cdpStatus = document.getElementById('cdpStatus');
+        if (m.terminalActive) {
+            termCard.classList.add('active');
+            termStatus.textContent = 'Active — zero config';
+        } else {
+            termCard.classList.remove('active');
+            termStatus.textContent = 'Inactive';
+        }
+        if (m.cdpConnected) {
+            cdpCard.classList.add('active');
+            cdpStatus.textContent = 'Connected on port ' + (m.port || '?');
+        } else {
+            cdpCard.classList.remove('active');
+            cdpStatus.textContent = 'Not connected';
         }
     }
     if (m.type === 'saved') {
@@ -613,6 +749,7 @@ function save() {
         type:           'save',
         pollInterval:   parseInt(document.getElementById('pollRange').value, 10),
         debugPort:      parseInt(document.getElementById('debugPort').value, 10) || 0,
+        engineMode:     document.getElementById('engineMode').value,
         bannedCommands: document.getElementById('bannedArea').value
             .split('\\n').map(s => s.trim()).filter(Boolean),
     });
@@ -621,6 +758,7 @@ function save() {
 function resetDefaults() {
     document.getElementById('pollRange').value = 800;
     document.getElementById('debugPort').value = 0;
+    document.getElementById('engineMode').value = 'auto';
     updatePollLabel();
     document.getElementById('bannedArea').value = [
         'rm -rf /', 'rm -rf ~', 'rm -rf *', 'format c:',
@@ -657,14 +795,14 @@ async function activate(context) {
     outputChannel = vscode.window.createOutputChannel('Shadow Accept');
     context.subscriptions.push(outputChannel);
 
-    log(`Shadow Accept v1.1 activating on ${currentIDE}`);
+    log(`Shadow Accept v1.2 activating on ${currentIDE}`);
 
-    cdpHandler = new CDPHandler(log);
+    engineManager = new EngineManager(log, vscode);
 
     // Apply custom port from config
     const cfg = getConfig();
     if (cfg.debugPort > 0) {
-        cdpHandler.setCustomPorts([cfg.debugPort]);
+        engineManager.setCustomPorts([cfg.debugPort]);
     }
 
     // ── Status bar ────────────────────────────────────────────────────────────
@@ -686,6 +824,7 @@ async function activate(context) {
     context.subscriptions.push(
         vscode.commands.registerCommand('shadow-accept.toggle',       () => cmdToggle(context)),
         vscode.commands.registerCommand('shadow-accept.openSettings', () => cmdOpenSettings(context)),
+        vscode.commands.registerCommand('shadow-accept.quickAccept',  () => cmdQuickAccept()),
     );
 
     // ── Config watcher ────────────────────────────────────────────────────────
@@ -694,7 +833,7 @@ async function activate(context) {
             if (e.affectsConfiguration('shadowAccept')) {
                 const newCfg = getConfig();
                 if (newCfg.debugPort > 0) {
-                    cdpHandler.setCustomPorts([newCfg.debugPort]);
+                    engineManager.setCustomPorts([newCfg.debugPort]);
                 }
                 if (isEnabled) {
                     log('Config changed, restarting poll');
