@@ -23,9 +23,9 @@ by **[NakedoMedia](https://nakedo.ai)** — MIT License — Free forever, no lim
 
 ### From VSIX
 ```bash
-code --install-extension shadow-accept-1.0.0.vsix
+code --install-extension shadow-accept-1.2.0.vsix
 # or for Antigravity:
-antigravity --install-extension shadow-accept-1.0.0.vsix
+antigravity --install-extension shadow-accept-1.2.0.vsix
 ```
 
 ### Manual (copy folder)
