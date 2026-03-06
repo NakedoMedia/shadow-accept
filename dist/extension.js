@@ -4733,6 +4733,29 @@ button.btn-secondary:hover { background: rgba(255,255,255,.09); }
     font-family: var(--mono); font-size: 11px; border: 1px solid rgba(255,255,255,.15);
 }
 
+/* \u2500\u2500 About box \u2500\u2500 */
+.about-box {
+    padding: 16px 18px; border-radius: 10px;
+    background: rgba(124,106,247,.04); border: 1px solid rgba(124,106,247,.12);
+    font-size: 13px; line-height: 1.65;
+}
+.about-box p { margin-bottom: 10px; }
+.about-box p:last-of-type { margin-bottom: 14px; }
+.about-meta { font-size: 11px; opacity: .5; }
+.about-link { color: var(--accent); cursor: pointer; text-decoration: none; font-weight: 600; }
+.about-link:hover { text-decoration: underline; }
+.about-links { display: flex; gap: 8px; flex-wrap: wrap; }
+.about-btn {
+    display: inline-block; padding: 6px 14px; border-radius: 6px; font-size: 12px;
+    font-weight: 600; cursor: pointer; text-decoration: none; color: var(--btn-fg);
+    background: var(--accent); border: none; transition: opacity .15s;
+}
+.about-btn:hover { opacity: .85; }
+.about-btn-ghost {
+    background: transparent; color: var(--fg); border: 1px solid rgba(255,255,255,.12);
+}
+.about-btn-ghost:hover { background: rgba(255,255,255,.05); opacity: 1; }
+
 /* \u2500\u2500 Footer \u2500\u2500 */
 .footer { margin-top: 32px; padding-top: 16px; border-top: 1px solid rgba(255,255,255,.06); display: flex; justify-content: space-between; align-items: center; }
 .footer-logo { font-size: 11px; opacity: .35; font-weight: 600; letter-spacing: .3px; }
@@ -4853,6 +4876,21 @@ Supports /regex/flags syntax.">${bannedStr}</textarea>
     <button class="btn btn-primary" onclick="save()">Save settings</button>
     <button class="btn btn-secondary" onclick="resetDefaults()">Reset defaults</button>
     <button class="btn btn-secondary" onclick="showLog()">View log</button>
+</div>
+
+<!-- About -->
+<div class="section">
+    <div class="section-title">About</div>
+    <div class="about-box">
+        <p><strong>Shadow Accept</strong> is an open-source extension by <a onclick="openWebsite()" class="about-link">NakedoMedia</a> that auto-accepts AI agent prompts across VS Code, Cursor, Antigravity and Windsurf.</p>
+        <p>Dual-engine architecture: zero-config Terminal Monitor + CDP fallback. Smart safety via banned commands. No telemetry, no API keys, no limits.</p>
+        <p class="about-meta">v1.2.0 &middot; MIT License &middot; Free forever</p>
+        <div class="about-links">
+            <a onclick="openWebsite()" class="about-btn">nakedo.ai</a>
+            <a onclick="openGitHub()" class="about-btn about-btn-ghost">GitHub</a>
+            <a onclick="reportIssue()" class="about-btn about-btn-ghost">Report issue</a>
+        </div>
+    </div>
 </div>
 
 <!-- Footer -->

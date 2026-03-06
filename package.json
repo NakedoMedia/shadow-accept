@@ -12,19 +12,28 @@
 	},
 	"categories": [
 		"Machine Learning",
+		"Programming Languages",
 		"Other"
 	],
 	"keywords": [
 		"antigravity",
 		"cursor",
+		"windsurf",
 		"vscode",
 		"ai",
 		"auto-accept",
 		"agent",
 		"copilot",
 		"claude",
+		"claude-code",
+		"aider",
+		"cody",
 		"terminal",
-		"zero-config"
+		"zero-config",
+		"productivity",
+		"automation",
+		"developer-tools",
+		"open-source"
 	],
 	"engines": {
 		"vscode": "^1.83.0"
@@ -138,10 +147,10 @@
 	"dependencies": {
 		"ws": "^8.19.0"
 	},
-	"author": "",
+	"author": "NakedoMedia (https://nakedo.ai)",
 	"type": "commonjs",
 	"bugs": {
 		"url": "https://github.com/NakedoMedia/shadow-accept/issues"
 	},
-	"homepage": "https://github.com/NakedoMedia/shadow-accept#readme"
+	"homepage": "https://nakedo.ai"
 }
